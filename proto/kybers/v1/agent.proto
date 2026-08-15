@@ -1,0 +1,350 @@
+syntax = "proto3";
+
+package kybers.v1;
+
+option go_package = "github.com/kybers/kybers/proto/gen/kybers/v1;kybersv1";
+
+// AgentService est exposé par le Control Plane. L'agent installé dans le
+// cluster client ouvre une connexion SORTANTE vers ce service : aucun port
+// entrant n'a besoin d'être ouvert côté cluster.
+service AgentService {
+  // Connect est un stream bidirectionnel de longue durée. L'agent envoie
+  // d'abord un Register, puis des heartbeats / statuts / logs. Le Control
+  // Plane pousse des commandes sur le même canal.
+  rpc Connect(stream AgentMessage) returns (stream ServerMessage);
+}
+
+// ---------------------------------------------------------------------------
+// Agent -> Control Plane
+// ---------------------------------------------------------------------------
+
+message AgentMessage {
+  oneof payload {
+    Register register = 1;
+    Heartbeat heartbeat = 2;
+    DeploymentStatus deployment_status = 3;
+    LogChunk log_chunk = 4;
+    PodEvent pod_event = 5;
+    CommandResult command_result = 6;
+    ClusterInfo cluster_info = 7;
+    UsageReport usage = 8;
+  }
+}
+
+message Register {
+  string cluster_id = 1;   // identifiant logique du cluster
+  string token = 2;        // secret partagé, monté via Secret K8s
+  string agent_version = 3;
+  string k8s_version = 4;
+}
+
+// Photographie du cluster, envoyée à la connexion puis rafraîchie
+// périodiquement. Sert à diagnostiquer sans accès kubectl.
+message ClusterInfo {
+  string k8s_version = 1;
+  string platform = 2;          // ex: k3s, eks, gke — déduit de la version
+  int32 node_count = 3;
+  int32 nodes_ready = 4;
+  repeated NodeInfo nodes = 5;
+
+  // Capacité cumulée du cluster.
+  string total_cpu = 6;         // en cœurs, ex "8"
+  string total_memory = 7;      // ex "32Gi"
+
+  // Ce qui conditionne le bon fonctionnement de Kybers.
+  bool has_metrics_server = 8;  // requis par l'autoscaling
+  bool has_cert_manager = 9;    // requis pour le TLS automatique
+  // Prometheus détecté dans le cluster : son URL interne, vide si absent.
+  string prometheus_url = 15;
+  // Source réellement utilisée : metrics-server | prometheus | aucune
+  string metrics_source = 16;
+  // Sources exploitables sur ce cluster. Permet au dashboard de proposer un
+  // choix plutôt que d'imposer la priorité par défaut.
+  repeated string available_metrics_sources = 17;
+  repeated string ingress_classes = 10;
+  repeated string ingress_ips = 11;  // IP publiques de l'ingress-controller
+  string storage_class = 12;         // classe de stockage par défaut
+
+  // Empreinte de Kybers sur ce cluster.
+  int32 managed_namespaces = 13;
+  int32 managed_pods = 14;
+}
+
+// Consommation réelle, relevée via metrics-server. Sans lui, aucun échantillon
+// n'est envoyé : le dashboard le signale plutôt que d'afficher des zéros.
+message UsageReport {
+  int64 ts_unix = 1;
+  repeated NodeUsage nodes = 2;
+  repeated AppUsage apps = 3;
+
+  // Agrégats du cluster, en unités Kubernetes.
+  int64 total_cpu_millis = 4;      // consommé
+  int64 total_cpu_capacity = 5;    // capacité
+  int64 total_memory_bytes = 6;
+  int64 total_memory_capacity = 7;
+}
+
+message NodeUsage {
+  string name = 1;
+  int64 cpu_millis = 2;
+  int64 cpu_capacity = 3;
+  int64 memory_bytes = 4;
+  int64 memory_capacity = 5;
+  // Nombre de GPU alloués sur ce nœud ; 0 si aucun.
+  int64 gpu_count = 6;
+  int64 gpu_allocated = 7;
+}
+
+// Consommation cumulée des pods d'une application déployée par Kybers.
+message AppUsage {
+  string namespace = 1;
+  string app_name = 2;
+  string deployment_id = 3;
+  int64 cpu_millis = 4;
+  int64 memory_bytes = 5;
+  int32 pod_count = 6;
+}
+
+message NodeInfo {
+  string name = 1;
+  bool ready = 2;
+  string role = 3;              // control-plane | worker
+  string architecture = 4;
+  string os_image = 5;
+  string kubelet_version = 6;
+  string internal_ip = 7;
+  string cpu_capacity = 8;
+  string memory_capacity = 9;
+  // Pression signalée par le kubelet : disque, mémoire ou PID saturés.
+  repeated string pressures = 10;
+}
+
+message Heartbeat {
+  int64 sent_at_unix = 1;
+}
+
+// Etat remonté pour un déploiement donné.
+message DeploymentStatus {
+  string deployment_id = 1;
+  Phase phase = 2;
+  string message = 3;        // détail lisible (erreur, cause, ...)
+  int32 ready_replicas = 4;
+  int32 desired_replicas = 5;
+  string url = 6;            // URL publique une fois l'Ingress prêt
+  // Cause technique quand phase = FAILED : ImagePullBackOff, CrashLoopBackOff,
+  // OOMKilled... Permet au dashboard d'afficher une explication actionnable.
+  string reason = 7;
+
+  enum Phase {
+    PHASE_UNSPECIFIED = 0;
+    PHASE_PENDING = 1;
+    PHASE_PROVISIONING = 2;
+    PHASE_RUNNING = 3;
+    PHASE_FAILED = 4;
+    PHASE_STOPPED = 5;   // scalé à zéro volontairement
+    PHASE_DELETED = 6;
+  }
+}
+
+message LogChunk {
+  string deployment_id = 1;
+  string pod_name = 2;
+  string line = 3;
+  int64 ts_unix = 4;
+}
+
+// Event Kubernetes remonté pour diagnostiquer un déploiement qui ne démarre pas.
+message PodEvent {
+  string deployment_id = 1;
+  string pod_name = 2;
+  string type = 3;      // Normal | Warning
+  string reason = 4;    // Pulling, Failed, BackOff, Unhealthy...
+  string message = 5;
+  int64 ts_unix = 6;
+}
+
+// Accusé d'exécution d'une commande de cycle de vie (scale, stop, rollback...).
+message CommandResult {
+  string command_id = 1;
+  string deployment_id = 2;
+  bool success = 3;
+  string message = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Control Plane -> Agent
+// ---------------------------------------------------------------------------
+
+message ServerMessage {
+  oneof payload {
+    RegisterAck register_ack = 1;
+    DeployCommand deploy = 2;
+    DeleteCommand delete = 3;
+    ScaleCommand scale = 4;
+    RestartCommand restart = 5;
+    LogStreamCommand log_stream = 6;
+    SetMetricsSourceCommand set_metrics_source = 7;
+  }
+}
+
+message RegisterAck {
+  bool accepted = 1;
+  string reason = 2;
+  int32 heartbeat_interval_seconds = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Configuration d'exécution
+// ---------------------------------------------------------------------------
+
+// Sonde de santé. Type vide = sonde désactivée.
+message Probe {
+  Type type = 1;
+  string path = 2;               // pour HTTP_GET
+  int32 port = 3;                // 0 = port du conteneur
+  int32 initial_delay_seconds = 4;
+  int32 period_seconds = 5;
+  int32 timeout_seconds = 6;
+  int32 failure_threshold = 7;
+  repeated string command = 8;   // pour EXEC
+
+  enum Type {
+    TYPE_UNSPECIFIED = 0;  // désactivée
+    TYPE_HTTP_GET = 1;
+    TYPE_TCP_SOCKET = 2;
+    TYPE_EXEC = 3;
+  }
+}
+
+// Requests/limits du conteneur. Chaînes au format Kubernetes ("100m", "256Mi").
+message Resources {
+  string cpu_request = 1;
+  string memory_request = 2;
+  string cpu_limit = 3;
+  string memory_limit = 4;
+}
+
+// Autoscaling horizontal. enabled=false => replicas fixes.
+message Autoscaling {
+  bool enabled = 1;
+  int32 min_replicas = 2;
+  int32 max_replicas = 3;
+  int32 target_cpu_percent = 4;
+}
+
+// Identifiants d'un registry privé, pour générer un imagePullSecret.
+message RegistryCredentials {
+  string server = 1;    // ex: ghcr.io, registry.gitlab.com
+  string username = 2;
+  string password = 3;  // token / mot de passe
+  string email = 4;
+}
+
+// Ordre de déploiement atomique d'une application dans un environnement.
+message DeployCommand {
+  string deployment_id = 1;
+  string app_name = 2;          // ex: "billing-api"
+  string environment = 3;       // ex: "staging" -> namespace "billing-api-staging"
+  string image = 4;             // image OCI tirée d'un registry
+  int32 replicas = 5;
+  // Port principal, celui que route l'Ingress. Conservé pour les agents qui
+  // ne connaissent pas encore `ports` : ils continuent de fonctionner en
+  // n'exposant que celui-ci.
+  int32 container_port = 6;
+  // Variables non sensibles -> ConfigMap.
+  map<string, string> env = 7;
+  string host = 8;              // hostname Ingress, vide = pas d'Ingress
+
+  // Variables sensibles -> Secret Kubernetes, jamais inscrites dans le PodSpec.
+  map<string, string> secret_env = 9;
+
+  Probe liveness_probe = 10;
+  Probe readiness_probe = 11;
+  Probe startup_probe = 12;
+
+  Resources resources = 13;
+  Autoscaling autoscaling = 14;
+
+  // Vide = image publique, aucun imagePullSecret créé.
+  RegistryCredentials registry = 15;
+
+  // Isole le namespace : refuse le trafic entrant hors ingress-controller et
+  // hors du namespace lui-même.
+  bool network_policy = 16;
+
+  // Quotas appliqués au namespace de l'environnement.
+  string quota_cpu = 17;
+  string quota_memory = 18;
+  int32 quota_pods = 19;
+
+  // Durcissement du conteneur. Opt-in : beaucoup d'images publiques tournent
+  // en root et seraient refusées par le kubelet si on l'imposait par défaut.
+  bool run_as_non_root = 20;
+  int64 run_as_user = 21;              // 0 = laisser l'image décider
+  bool read_only_root_filesystem = 22;
+
+  // true = Ingress avec TLS et cert-manager. Faux pour un hostname nip.io ou
+  // un domaine non maîtrisé : aucun certificat ne pourrait être émis.
+  bool tls = 23;
+
+  // Ports ouverts par l'image. Une image peut en ouvrir plusieurs — un port
+  // applicatif et un port de métriques, par exemple. Tous deviennent des
+  // entrées du Service ; seul `exposed` est routé par l'Ingress.
+  //
+  // Vide = comportement historique, fondé sur `container_port`.
+  repeated ContainerPortSpec ports = 24;
+}
+
+// ContainerPortSpec décrit un port ouvert par le conteneur.
+message ContainerPortSpec {
+  int32 port = 1;
+  // Nom Kubernetes (http, metrics, grpc…) : requis dès qu'un Service porte
+  // plusieurs ports, et utilisable comme cible de probe.
+  string name = 2;
+  // Port routé par l'Ingress. Au plus un par déploiement.
+  bool exposed = 3;
+  // "TCP" (défaut) ou "UDP".
+  string protocol = 4;
+}
+
+message DeleteCommand {
+  string deployment_id = 1;
+  string app_name = 2;
+  string environment = 3;
+  // true = supprime tout le namespace de l'environnement ;
+  // false = supprime seulement les ressources de l'application.
+  bool delete_namespace = 4;
+}
+
+// Change le nombre de replicas. 0 = arrêter l'application sans la supprimer.
+message ScaleCommand {
+  string command_id = 1;
+  string deployment_id = 2;
+  string app_name = 3;
+  string environment = 4;
+  int32 replicas = 5;
+}
+
+// Redémarre les pods (rollout restart) sans changer la configuration.
+message RestartCommand {
+  string command_id = 1;
+  string deployment_id = 2;
+  string app_name = 3;
+  string environment = 4;
+}
+
+// Impose la source de métriques choisie par l'utilisateur.
+message SetMetricsSourceCommand {
+  // "metrics-server", "prometheus", ou vide pour revenir au choix automatique.
+  string source = 1;
+  // URL Prometheus à utiliser ; vide = celle détectée automatiquement.
+  string prometheus_url = 2;
+}
+
+// Démarre ou arrête le suivi des logs en continu pour un déploiement.
+message LogStreamCommand {
+  string deployment_id = 1;
+  string app_name = 2;
+  string environment = 3;
+  bool follow = 4;   // true = démarrer, false = arrêter
+}

@@ -1,0 +1,35 @@
+Agent Kybers installé dans le namespace {{ .Release.Namespace }}.
+
+  Cluster        : {{ .Values.controlPlane.clusterId }}
+  Control Plane  : {{ .Values.controlPlane.addr }}
+  Chiffrement    : {{ if .Values.controlPlane.insecure }}AUCUN (gRPC en clair){{ else }}TLS{{ end }}
+
+L'agent ouvre une connexion sortante : aucun port entrant n'est à ouvrir sur ce
+cluster.
+
+Vérifier qu'il est connecté :
+
+  kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/name=kybers-agent -f
+
+Le message attendu est « connecté au control plane ». Côté Control Plane, le
+cluster doit apparaître dans :
+
+  curl <control-plane>/healthz
+
+Si l'agent ne se connecte pas :
+
+  - « connexion perdue » en boucle
+      → l'adresse {{ .Values.controlPlane.addr }} n'est pas joignable depuis ce
+        cluster, ou le Control Plane est arrêté.
+
+  - « enregistrement refusé »
+      → le couple (clusterId, token) ne correspond à aucune ligne de la table
+        clusters du Control Plane.
+
+  - pod en ImagePullBackOff
+      → l'image {{ .Values.image.repository }}:{{ .Values.image.tag }} n'est pas
+        disponible sur les nœuds. Chargez-la ou publiez-la sur un registre.
+{{ if .Values.controlPlane.insecure }}
+ATTENTION : le trafic vers le Control Plane n'est pas chiffré
+(controlPlane.insecure=true). À ne pas conserver hors réseau de confiance.
+{{ end }}

@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kybers-agent.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kybers-agent.labels" . | nindent 4 }}
+spec:
+  # Un seul agent par cluster : deux instances traiteraient les mêmes ordres.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "kybers-agent.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kybers-agent.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Force le redémarrage du pod quand le token change.
+        checksum/secret: {{ toJson .Values.auth | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "kybers-agent.serviceAccountName" . }}
+      # L'agent pilote tout le cluster : il doit pouvoir démarrer même sur un
+      # nœud saturé, et ne pas être évincé en premier sous pression.
+      priorityClassName: {{ .Values.priorityClassName | default "" | quote }}
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: agent
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Seul port ouvert : les sondes de santé. L'agent n'accepte aucune
+          # commande entrante.
+          ports:
+            - name: health
+              containerPort: {{ .Values.health.port }}
+          env:
+            - name: CONTROL_PLANE_ADDR
+              value: {{ .Values.controlPlane.addr | quote }}
+            - name: CLUSTER_ID
+              value: {{ .Values.controlPlane.clusterId | quote }}
+            - name: INSECURE
+              value: {{ .Values.controlPlane.insecure | quote }}
+            {{- with .Values.metrics.prometheusUrl }}
+            - name: PROMETHEUS_URL
+              value: {{ . | quote }}
+            {{- end }}
+            - name: HEALTH_ADDR
+              value: ":{{ .Values.health.port }}"
+            - name: STUCK_AFTER_SECONDS
+              value: {{ .Values.health.stuckAfterSeconds | quote }}
+            - name: CLUSTER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "kybers-agent.secretName" . }}
+                  key: token
+          # Laisse le temps à l'agent de joindre le Control Plane au démarrage
+          # sans qu'un réseau lent déclenche un redémarrage.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 5
+            failureThreshold: 12
+          # Redémarre l'agent seulement s'il est FIGÉ : une déconnexion normale
+          # est gérée par sa reconnexion avec backoff.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # Reflète la connexion au Control Plane : un agent déconnecté apparaît
+          # « 0/1 Ready » dans kubectl, ce qui rend le problème visible.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 2
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

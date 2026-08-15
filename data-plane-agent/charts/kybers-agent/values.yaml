@@ -1,0 +1,72 @@
+# Agent Kybers — à installer sur chaque cluster à piloter.
+#
+# L'agent ouvre une connexion SORTANTE vers le Control Plane : aucun port
+# entrant n'est à ouvrir sur ce cluster.
+
+image:
+  # Image publiée, utilisable telle quelle. Le script d'installation la
+  # surcharge avec la valeur configurée sur le Control Plane.
+  repository: maxwellfaraday/kybers-agent
+  tag: dev
+  # IfNotPresent permet d'utiliser une image chargée localement dans le cluster
+  # (minikube image load / k3s ctr images import) sans passer par un registre.
+  pullPolicy: IfNotPresent
+
+controlPlane:
+  # Adresse du Control Plane joignable DEPUIS CE CLUSTER, au format host:port.
+  # Une adresse locale (localhost, host.docker.internal) ne fonctionne que si
+  # le Control Plane tourne sur les nœuds eux-mêmes.
+  addr: ""
+  # Identifiant du cluster ; doit correspondre à une ligne de la table clusters
+  # du Control Plane.
+  clusterId: "local"
+  # true = gRPC en clair. À passer à false dès qu'un TLS est en place.
+  insecure: true
+
+# Secret d'authentification auprès du Control Plane.
+auth:
+  token: ""
+  # Nom d'un Secret existant contenant une clé "token". Préférable en
+  # production : le secret ne transite pas par les values Helm.
+  existingSecret: ""
+
+# Source des métriques de consommation.
+# Vide = détection automatique (metrics-server, puis Prometheus s'il est
+# trouvé dans le cluster). À renseigner pour un Prometheus hors cluster ou
+# une instance précise (Thanos, Mimir, VictoriaMetrics).
+metrics:
+  prometheusUrl: ""
+
+# Sondes de santé, lues par Kubernetes.
+health:
+  port: 8081
+  # Durée sans aucun échange avec le Control Plane au-delà de laquelle l'agent
+  # est considéré comme figé et redémarré. Doit rester largement supérieure à
+  # l'intervalle des heartbeats (15 s) pour ne pas redémarrer un agent
+  # seulement déconnecté.
+  stuckAfterSeconds: 300
+
+# Classe de priorité du pod. « system-cluster-critical » évite que l'agent soit
+# évincé avant les applications qu'il pilote ; vide = priorité normale.
+priorityClassName: ""
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# L'agent doit pouvoir créer des namespaces et y déployer : ces droits sont
+# nécessairement à l'échelle du cluster.
+rbac:
+  create: true
+
+serviceAccount:
+  create: true
+  name: ""
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

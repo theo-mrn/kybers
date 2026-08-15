@@ -1,0 +1,6 @@
+apiVersion: v2
+name: kybers-agent
+description: Agent Data Plane Kybers — déploie les applications pilotées par le Control Plane
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

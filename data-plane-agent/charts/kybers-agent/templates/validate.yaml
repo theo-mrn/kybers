@@ -1,0 +1,20 @@
+{{/*
+Vérifications à l'installation. Sans elles, une valeur manquante ne se
+manifesterait qu'au démarrage du pod, dans les logs de l'agent.
+*/}}
+
+{{- if not .Values.controlPlane.addr }}
+{{- fail "\n\ncontrolPlane.addr est requis : adresse du Control Plane joignable DEPUIS CE CLUSTER (host:port).\nExemple : --set controlPlane.addr=kybers.exemple.fr:9090\n" }}
+{{- end }}
+
+{{- if and (not .Values.auth.token) (not .Values.auth.existingSecret) }}
+{{- fail "\n\nauth.token ou auth.existingSecret est requis : jeton d'authentification du cluster auprès du Control Plane.\nExemple : --set auth.token=<token>\n" }}
+{{- end }}
+
+{{/*
+Une adresse locale ne peut pas être résolue depuis un pod : le piège le plus
+fréquent lorsque le Control Plane tourne sur le poste de l'installateur.
+*/}}
+{{- if or (hasPrefix "localhost:" .Values.controlPlane.addr) (hasPrefix "127.0.0.1:" .Values.controlPlane.addr) }}
+{{- fail "\n\ncontrolPlane.addr pointe sur localhost : depuis un pod, cette adresse désigne le pod lui-même, pas votre machine.\nUtilisez une adresse joignable depuis le cluster (IP publique, nom DNS, ou tunnel).\n" }}
+{{- end }}
