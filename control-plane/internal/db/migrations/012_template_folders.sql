@@ -36,5 +36,6 @@ CREATE INDEX IF NOT EXISTS idx_file_templates_folder
 -- peuvent proposer leur propre « Dockerfile ».
 ALTER TABLE file_templates DROP CONSTRAINT IF EXISTS file_templates_org_id_name_key;
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_file_templates_unique_name
-    ON file_templates(org_id, COALESCE(folder_id, '00000000-0000-0000-0000-000000000000'::uuid), name);
+-- Cet index unique sur le nom a été remplacé par un index sur le chemin en
+-- 013 : deux README destinés à des chemins différents sont légitimes. Il n'est
+-- plus créé ici, la 013 s'en chargeant sur la bonne colonne.

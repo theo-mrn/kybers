@@ -57,6 +57,35 @@ func (d *DB) Close() { d.Pool.Close() }
 // Migrate applique les fichiers SQL embarqués. Ils sont idempotents
 // (CREATE TABLE IF NOT EXISTS), donc rejouables à chaque démarrage.
 func (d *DB) Migrate(ctx context.Context) error {
+	// Sans registre, chaque démarrage rejouait toute l'histoire : cela n'a
+	// tenu que tant que tout était idempotent, et cassait dès qu'une migration
+	// ultérieure défaisait la précédente.
+	if _, err := d.Pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			name       TEXT PRIMARY KEY,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`); err != nil {
+		return err
+	}
+
+	applied := map[string]bool{}
+	rows, err := d.Pool.Query(ctx, `SELECT name FROM schema_migrations`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return err
+		}
+		applied[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
 	entries, err := migrationsFS.ReadDir("migrations")
 	if err != nil {
 		return err
@@ -69,12 +98,31 @@ func (d *DB) Migrate(ctx context.Context) error {
 	sort.Strings(names)
 
 	for _, name := range names {
+		if applied[name] {
+			continue
+		}
 		sql, err := migrationsFS.ReadFile("migrations/" + name)
 		if err != nil {
 			return err
 		}
-		if _, err := d.Pool.Exec(ctx, string(sql)); err != nil {
+
+		// Une migration et son enregistrement forment un tout : les séparer
+		// laisserait une migration appliquée mais non retenue, donc rejouée.
+		tx, err := d.Pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, string(sql)); err != nil {
+			tx.Rollback(ctx)
 			return fmt.Errorf("migration %s: %w", name, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO schema_migrations (name) VALUES ($1)`, name); err != nil {
+			tx.Rollback(ctx)
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return err
 		}
 	}
 	return nil
