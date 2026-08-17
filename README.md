@@ -121,7 +121,8 @@ kybers/
 │
 └── docs/
     ├── GETTING_STARTED.md         Guide de test bout en bout
-    └── RUNTIME.md                 Configuration d'exécution et cycle de vie
+    ├── RUNTIME.md                 Configuration d'exécution et cycle de vie
+    └── API.md                     API HTTP, spécification OpenAPI, appel depuis un CI
 ```
 
 ---
@@ -146,6 +147,7 @@ Puis <http://localhost:3000>.
 Guides :
 - **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** — installation, Helm, premier déploiement
 - **[docs/RUNTIME.md](docs/RUNTIME.md)** — probes, secrets, registries privés, scale, rollback, diagnostic
+- **[docs/API.md](docs/API.md)** — API HTTP, spécification OpenAPI, déploiement depuis une pipeline
 - **[docs/AGENT.md](docs/AGENT.md)** — l'agent en détail : rôle, installation, permissions, dépannage
 
 ---

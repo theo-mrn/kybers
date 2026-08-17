@@ -277,6 +277,36 @@ export type BuiltinGoldenPath = {
   files: FileTemplate[];
 };
 
+/** Spécification OpenAPI, telle que le Control Plane la sert. */
+export type OpenAPISpec = {
+  openapi: string;
+  info: { title: string; version: string; description?: string };
+  servers?: { url: string }[];
+  tags?: { name: string }[];
+  paths: Record<string, Record<string, OpenAPIOperation>>;
+  components?: { schemas?: Record<string, OpenAPISchema> };
+};
+
+export type OpenAPIOperation = {
+  summary?: string;
+  tags?: string[];
+  parameters?: { name: string; in: string; required?: boolean }[];
+  requestBody?: {
+    content: Record<string, { schema: OpenAPISchema }>;
+  };
+  responses?: Record<string, { description?: string }>;
+  security?: unknown[];
+};
+
+export type OpenAPISchema = {
+  type?: string;
+  format?: string;
+  properties?: Record<string, OpenAPISchema>;
+  required?: string[];
+  items?: OpenAPISchema;
+  $ref?: string;
+};
+
 export type TemplateFolder = {
   id: string;
   org_id: string;
@@ -613,6 +643,9 @@ export const api = {
     ),
 
   /** Variables Actions du dépôt ; leurs valeurs sont lisibles. */
+  /** Spécification OpenAPI de l'API HTTP, servie sans authentification. */
+  openapi: () => request<OpenAPISpec>("/api/v1/openapi.json"),
+
   /** Environnements déclarés sur le dépôt ; ils cloisonnent les secrets. */
   listRepoEnvs: (appId: string) =>
     request<string[]>(`/api/v1/apps/${appId}/repo-envs`),

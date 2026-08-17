@@ -104,6 +104,9 @@ func (a *API) Routes() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", a.health)
+	// Spécification de l'API, servie sans authentification : elle ne décrit
+	// que des contrats, et un générateur de client doit pouvoir la lire.
+	mux.HandleFunc("GET /api/v1/openapi.json", a.openapi)
 	// Script d'installation de l'agent, servi sans authentification : il ne
 	// contient aucun secret, le jeton est fourni par l'utilisateur.
 	mux.HandleFunc("GET /install.sh", a.installSh)
@@ -265,6 +268,22 @@ func cors(next http.Handler) http.Handler {
 // ---------------------------------------------------------------------------
 // Santé & clusters
 // ---------------------------------------------------------------------------
+
+// openapi sert la spécification de l'API HTTP.
+func (a *API) openapi(w http.ResponseWriter, r *http.Request) {
+	schemas := map[string]any{}
+	for name, model := range exposedModels {
+		schemas[name] = schemaOf(model)
+	}
+
+	// L'URL du serveur vient de la requête : une instance auto-hébergée ne
+	// connaît pas son adresse publique autrement.
+	scheme := "https"
+	if r.TLS == nil && !strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		scheme = "http"
+	}
+	writeJSON(w, http.StatusOK, buildOpenAPI(scheme+"://"+r.Host, schemas))
+}
 
 func (a *API) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
