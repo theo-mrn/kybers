@@ -1,78 +1,101 @@
+import Link from "next/link";
 import { redirect } from "next/navigation";
-import { FileCode, Info } from "lucide-react";
+import { Boxes, FileCode } from "lucide-react";
 
-import { api } from "@/lib/api";
-import { TemplateDialog } from "@/components/template-dialog";
-import { FolderDialog } from "@/components/folder-dialog";
+import { api, type BuiltinGoldenPath } from "@/lib/api";
 import { TemplateExplorer } from "@/components/template-explorer";
-import { Card, EmptyState, PageHeader } from "@/components/ui";
+import { GoldenPathsPanel } from "@/components/golden-paths-panel";
+import { PageHeader } from "@/components/ui";
+import { Badge } from "@/components/ui/badge";
+import { cn } from "@/lib/utils";
 
 export const dynamic = "force-dynamic";
+
+const TABS = [
+  ["types", "Types d'application", Boxes],
+  ["fichiers", "Fichiers libres", FileCode],
+] as const;
 
 /**
  * Bibliothèque de modèles de l'organisation.
  *
- * Les modèles sont lus dans un explorateur : les dossiers groupent par
- * intention — « service Go », « conformité » — et l'arborescence montre la
- * forme réelle du dépôt que ces chemins produiront.
+ * Deux matières distinctes, deux onglets : les types d'application, qui
+ * produisent un dépôt complet et portent leurs propres fichiers ; les fichiers
+ * libres, ajoutés à la demande à n'importe quelle application.
+ *
+ * Les fichiers d'un type n'apparaissent pas dans les fichiers libres : ils
+ * n'ont de sens qu'avec le type qui les accompagne, et les mélanger rendait
+ * les deux listes illisibles.
  */
-export default async function TemplatesPage() {
+export default async function TemplatesPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ tab?: string }>;
+}) {
+  const { tab } = await searchParams;
+  const activeTab = TABS.some(([k]) => k === tab) ? tab! : "types";
+
   if (!(await api.me().catch(() => null))) redirect("/login");
 
-  const [templates, folders] = await Promise.all([
+  const [templates, folders, builtin] = await Promise.all([
     api.listTemplates().catch(() => []),
     api.listFolders().catch(() => []),
+    api.listBuiltinGoldenPaths().catch(() => [] as BuiltinGoldenPath[]),
   ]);
+
+  const goldenPaths = folders.filter((f) => f.is_golden_path);
+  const goldenIds = new Set(goldenPaths.map((f) => f.id));
+
+  // Ce qui appartient à un type lui reste attaché ; le reste est libre.
+  const goldenFiles = templates.filter((t) => goldenIds.has(t.folder_id ?? ""));
+  const freeFiles = templates.filter((t) => !goldenIds.has(t.folder_id ?? ""));
+  const freeFolders = folders.filter((f) => !f.is_golden_path);
+
+  const counts: Record<string, number> = {
+    types: goldenPaths.length,
+    fichiers: freeFiles.length,
+  };
 
   return (
     <>
       <PageHeader
         title="Modèles"
-        description="Les fichiers que Kybers écrit dans vos dépôts. Groupez-les en dossiers pour les ajouter en bloc."
+        description="Les types d'application qui produisent un dépôt prêt à démarrer, et les fichiers que vous ajoutez à la demande."
       />
 
-      {templates.length === 0 && folders.length === 0 ? (
-        <Card title="Modèles" icon={FileCode}>
-          <EmptyState
-            icon={FileCode}
-            title="Aucun modèle"
-            description="Créez un dossier pour regrouper les fichiers d'un même usage, ou un modèle isolé."
+      <nav className="flex items-center gap-1 border-b border-border">
+        {TABS.map(([key, label, Icon]) => (
+          <Link
+            key={key}
+            href={`/modeles?tab=${key}`}
+            aria-current={activeTab === key ? "page" : undefined}
+            className={cn(
+              "-mb-px flex items-center gap-1.5 border-b-2 px-3 py-2 text-sm transition-colors",
+              activeTab === key
+                ? "border-primary font-medium text-primary"
+                : "border-transparent text-muted-foreground hover:text-foreground",
+            )}
           >
-            <FolderDialog />
-            <TemplateDialog folders={folders} />
-          </EmptyState>
-        </Card>
-      ) : (
-        <TemplateExplorer templates={templates} folders={folders} />
-      )}
+            <Icon className="size-3.5" />
+            {label}
+            {counts[key] > 0 && (
+              <Badge variant="secondary" className="ml-1">
+                {counts[key]}
+              </Badge>
+            )}
+          </Link>
+        ))}
+      </nav>
 
-      <Card title="Comment ils sont utilisés" icon={Info}>
-        <div className="space-y-2 text-sm text-muted-foreground">
-          <p>
-            À la création d&apos;une application, vous cochez les fichiers à
-            écrire. Un <strong className="text-foreground">dossier</strong>{" "}
-            s&apos;ajoute d&apos;un seul geste, avec tout ce qu&apos;il contient.
-          </p>
-          <p>
-            Un dossier de modèles n&apos;est pas un dossier du dépôt : il groupe
-            par usage. C&apos;est le{" "}
-            <strong className="text-foreground">chemin</strong> de chaque modèle
-            qui décide de son emplacement — d&apos;où l&apos;arborescence
-            ci-dessus.
-          </p>
-          <p>
-            Les substitutions <code className="font-mono">{"{{app}}"}</code>,{" "}
-            <code className="font-mono">{"{{repo}}"}</code>,{" "}
-            <code className="font-mono">{"{{env}}"}</code> et{" "}
-            <code className="font-mono">{"{{endpoint}}"}</code> sont remplacées à
-            l&apos;écriture, dans le chemin comme dans le contenu.
-          </p>
-          <p>
-            Modifier un modèle n&apos;affecte pas les dépôts déjà écrits : il
-            sert de point de départ, pas de source de vérité.
-          </p>
-        </div>
-      </Card>
+      {activeTab === "types" ? (
+        <GoldenPathsPanel
+          paths={goldenPaths}
+          builtin={builtin}
+          templates={goldenFiles}
+        />
+      ) : (
+        <TemplateExplorer templates={freeFiles} folders={freeFolders} />
+      )}
     </>
   );
 }

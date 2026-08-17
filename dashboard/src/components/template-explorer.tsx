@@ -8,6 +8,7 @@ import {
   Copy,
   FileCode,
   FileText,
+  Boxes,
   FolderOpen,
   Layers,
   Search,
@@ -195,7 +196,9 @@ export function TemplateExplorer({
                   <FolderRow
                     key={f.id}
                     label={f.name}
-                    icon={FolderOpen}
+                    // Un type se distingue au premier regard : il ouvre un
+                    // parcours de création, pas seulement un rangement.
+                    icon={f.is_golden_path ? Boxes : FolderOpen}
                     count={counts.get(f.id) ?? 0}
                     active={folderId === f.id}
                     onClick={() => setFolderId(f.id)}
@@ -220,6 +223,7 @@ export function TemplateExplorer({
               <div className="flex shrink-0 items-center gap-1 border-t border-border p-2">
                 <FolderDialog
                   folder={folderById.get(folderId)}
+                  templates={templates.filter((t) => t.folder_id === folderId)}
                   trigger={
                     <Button variant="ghost" size="xs">
                       Renommer
