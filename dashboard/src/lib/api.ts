@@ -260,6 +260,23 @@ export type Tag = {
   image: string;
 };
 
+/** Version d'un runtime, tirée des tags publiés par son image. */
+export type RuntimeVersion = {
+  name: string;
+  major: number;
+  minor: number;
+  patch: number;
+  /** Le tag ne porte que la majeure : il suit les correctifs. */
+  floating: boolean;
+};
+
+/** Type fourni avec Kybers, proposé à l'installation. */
+export type BuiltinGoldenPath = {
+  key: string;
+  folder: TemplateFolder;
+  files: FileTemplate[];
+};
+
 export type TemplateFolder = {
   id: string;
   org_id: string;
@@ -267,6 +284,30 @@ export type TemplateFolder = {
   description: string;
   /** Nombre de modèles qu'il contient. */
   file_count: number;
+
+  /** Le dossier est proposé comme type d'application à la création. */
+  is_golden_path: boolean;
+  /** Clé d'icône lucide, résolue côté client. */
+  icon: string;
+  /** Image dont les tags font les versions : "node", "python", "golang". */
+  runtime_image: string;
+  /** Versions de repli, si l'image est absente ou le registre injoignable. */
+  versions: string;
+  /** Version retenue par défaut, parmi celles proposées. */
+  default_version: string;
+  /** Port écouté par l'exécution ; 0 = défaut de l'instance. */
+  default_port: number;
+  cpu_request: string;
+  memory_request: string;
+  cpu_limit: string;
+  memory_limit: string;
+  /** Chemin de la sonde HTTP ; vide = pas de sonde préconfigurée. */
+  probe_path: string;
+  /** Délai avant la première sonde, en secondes. */
+  probe_initial_delay: number;
+  /** UID non-root imposé par l'image de base ; 0 = non contraint. */
+  run_as_user: number;
+
   created_at: string;
   updated_at: string;
 };
@@ -554,6 +595,69 @@ export const api = {
     ),
 
   // --- Secrets : seuls les NOMS sont lisibles ---
+  /** Noms des secrets du dépôt GitHub ; les valeurs ne sont jamais restituées. */
+  listRepoSecrets: (appId: string, env = "") =>
+    request<{ name: string; updated_at: string }[]>(
+      `/api/v1/apps/${appId}/repo-secrets${env ? `?env=${encodeURIComponent(env)}` : ""}`,
+    ),
+
+  /** Dépose des secrets sur le dépôt ; Kybers n'en garde aucune valeur. */
+  putRepoSecrets: (
+    appId: string,
+    secrets: { key: string; value: string }[],
+    env = "",
+  ) =>
+    request<{ repo: string; written: string[] }>(
+      `/api/v1/apps/${appId}/repo-secrets${env ? `?env=${encodeURIComponent(env)}` : ""}`,
+      { method: "PUT", body: JSON.stringify({ secrets }) },
+    ),
+
+  /** Variables Actions du dépôt ; leurs valeurs sont lisibles. */
+  /** Environnements déclarés sur le dépôt ; ils cloisonnent les secrets. */
+  listRepoEnvs: (appId: string) =>
+    request<string[]>(`/api/v1/apps/${appId}/repo-envs`),
+
+  createRepoEnv: (appId: string, name: string) =>
+    request<{ name: string }>(
+      `/api/v1/apps/${appId}/repo-envs/${encodeURIComponent(name)}`,
+      { method: "PUT" },
+    ),
+
+  deleteRepoEnv: (appId: string, name: string) =>
+    request<void>(
+      `/api/v1/apps/${appId}/repo-envs/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    ),
+
+  listRepoVars: (appId: string, env = "") =>
+    request<{ name: string; value: string }[]>(
+      `/api/v1/apps/${appId}/repo-vars${env ? `?env=${encodeURIComponent(env)}` : ""}`,
+    ),
+
+  putRepoVars: (
+    appId: string,
+    variables: { key: string; value: string }[],
+    env = "",
+  ) =>
+    request<{ repo: string; written: string[] }>(
+      `/api/v1/apps/${appId}/repo-vars${env ? `?env=${encodeURIComponent(env)}` : ""}`,
+      { method: "PUT", body: JSON.stringify({ variables }) },
+    ),
+
+  deleteRepoVar: (appId: string, name: string, env = "") => {
+    return request<void>(
+      `/api/v1/apps/${appId}/repo-vars/${name}${env ? `?env=${encodeURIComponent(env)}` : ""}`,
+      { method: "DELETE" },
+    );
+  },
+
+  deleteRepoSecret: (appId: string, name: string, env = "") => {
+    return request<void>(
+      `/api/v1/apps/${appId}/repo-secrets/${name}${env ? `?env=${encodeURIComponent(env)}` : ""}`,
+      { method: "DELETE" },
+    );
+  },
+
   listSecretKeys: (appId: string, environment: string) =>
     request<{ keys: string[] }>(
       `/api/v1/apps/${appId}/secrets?environment=${encodeURIComponent(environment)}`,
@@ -607,6 +711,21 @@ export const api = {
 
   // --- Modèles de fichiers ---
   listFolders: () => request<TemplateFolder[]>("/api/v1/template-folders"),
+
+  /** Types fournis avec Kybers, pas encore installés dans l'organisation. */
+  listBuiltinGoldenPaths: () =>
+    request<BuiltinGoldenPath[]>("/api/v1/golden-paths/builtin"),
+
+  /** Versions disponibles pour un type ; `source` dit d'où elles viennent. */
+  listRuntimeVersions: (folderId: string, all = false) =>
+    request<{ versions: RuntimeVersion[]; source: string }>(
+      `/api/v1/template-folders/${folderId}/versions${all ? "?all=1" : ""}`,
+    ),
+
+  installGoldenPath: (key: string) =>
+    request<TemplateFolder>(`/api/v1/golden-paths/builtin/${key}`, {
+      method: "POST",
+    }),
   saveFolder: (f: Partial<TemplateFolder> & { id?: string }) =>
     request<TemplateFolder>(
       f.id ? `/api/v1/template-folders/${f.id}` : "/api/v1/template-folders",
@@ -652,6 +771,8 @@ export const api = {
     repo: string;
     files: { path: string; content: string }[];
     token_name?: string;
+    /** Secrets chiffrés déposés sur le dépôt, lisibles par le CI seul. */
+    secrets?: { key: string; value: string }[];
   }) =>
     request<{
       repo: string;
@@ -922,4 +1043,84 @@ export function parseEnvBlock(raw: string): Record<string, string> {
     if (idx > 0) vars[trimmed.slice(0, idx).trim()] = trimmed.slice(idx + 1).trim();
   }
   return vars;
+}
+
+/**
+ * Découpe un bloc collé en paires clé/valeur.
+ *
+ * Accepte ce qu'on récupère réellement : un `.env`, un export shell, un
+ * tableau collé depuis une documentation, ou plusieurs paires sur une même
+ * ligne. Les guillemets entourant la valeur sont retirés — ils appartiennent à
+ * la syntaxe du fichier, pas à la valeur.
+ */
+export function parseEnvPairs(raw: string): { key: string; value: string }[] {
+  const out: { key: string; value: string }[] = [];
+
+  for (const line of raw.split(/\r?\n/)) {
+    for (const chunk of splitPairs(line)) {
+      const pair = parsePair(chunk);
+      if (pair) out.push(pair);
+    }
+  }
+  return out;
+}
+
+/**
+ * Sépare les paires écrites sur une même ligne.
+ *
+ * On ne coupe qu'avant ce qui ressemble à une nouvelle clé — `ESPACE NOM=` —
+ * car une valeur peut légitimement contenir des espaces : `GREETING=hello
+ * world` doit rester entier.
+ */
+function splitPairs(line: string): string[] {
+  const s = line.trim();
+  if (!s || s.startsWith("#")) return [];
+
+  const cuts: number[] = [];
+  const re = /\s+(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s))) {
+    cuts.push(m.index);
+    // Reprendre au début du nom : le `=` consommé pourrait masquer la paire
+    // suivante si deux se touchent.
+    re.lastIndex = m.index + m[0].length - 1;
+  }
+  if (cuts.length === 0) return [s];
+
+  const out: string[] = [];
+  let from = 0;
+  for (const at of cuts) {
+    out.push(s.slice(from, at));
+    from = at;
+  }
+  out.push(s.slice(from));
+  return out;
+}
+
+/** Lit une paire isolée : `CLÉ=valeur` ou `CLÉ: valeur`. */
+function parsePair(chunk: string): { key: string; value: string } | null {
+  let s = chunk.trim();
+  if (!s || s.startsWith("#")) return null;
+
+  // `export KEY=value` est la forme la plus courante d'un extrait de doc.
+  s = s.replace(/^export\s+/, "");
+
+  // Séparateur : `=` ou `:` — un YAML collé reste exploitable. Le premier
+  // rencontré tranche, une valeur peut contenir les deux.
+  const at = s.search(/[=:]/);
+  if (at <= 0) return null;
+
+  const key = s.slice(0, at).trim();
+  let value = s.slice(at + 1).trim();
+
+  // Guillemets de syntaxe, et virgule finale d'un tableau.
+  value = value.replace(/,$/, "").trim();
+  if (
+    (value.startsWith('"') && value.endsWith('"')) ||
+    (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    value = value.slice(1, -1);
+  }
+
+  return key ? { key, value } : null;
 }

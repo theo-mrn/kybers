@@ -1,14 +1,13 @@
 "use client";
 
 import * as React from "react";
-import { useState, useTransition } from "react";
+import { useState } from "react";
 import {
   Check,
   Link2,
   Lock,
   Plug,
   Plus,
-  Loader2,
   TriangleAlert,
   XCircle,
 } from "lucide-react";
@@ -36,16 +35,33 @@ export function GitStep({
   status,
   appName,
   onResolved,
+  onCreateRequest,
+  onReady,
 }: {
   status: GitStatus;
   /** Sert de nom par défaut au dépôt à créer. */
   appName: string;
   /** Remonte la référence retenue, pour l'étape suivante. */
   onResolved?: (repo: string) => void;
+  /**
+   * Remonte la demande de création, jouée à la validation finale.
+   *
+   * Le dépôt n'est plus créé à cette étape : abandonner le parcours ensuite
+   * laissait un dépôt vide sur le compte de l'utilisateur.
+   */
+  onCreateRequest?: (
+    req: { owner: string; name: string; private: boolean } | null,
+  ) => void;
+  /**
+   * Reçoit la fonction de vérification, déclenchée par « Continuer ».
+   *
+   * Un bouton « Vérifier » séparé faisait double emploi : on ne quitte l'étape
+   * que pour continuer, et continuer suppose un dépôt résolu.
+   */
+  onReady?: (probe: () => Promise<boolean>) => void;
 }) {
   const [mode, setMode] = useState<"link" | "create">("link");
   const [state, setState] = useState<GitProbeState>(null);
-  const [pending, startTransition] = useTransition();
 
   // Les champs sont lus à la demande : ce composant vit DANS le formulaire de
   // création, un <form> imbriqué serait invalide et React le refuse.
@@ -54,24 +70,55 @@ export function GitStep({
   const nameRef = React.useRef<HTMLInputElement>(null);
   const privateRef = React.useRef<HTMLInputElement>(null);
 
-  function probe() {
+  /**
+   * Résout le dépôt saisi. Retourne faux si l'étape ne peut pas être quittée.
+   *
+   * Un champ vide n'est pas un échec : continuer sans dépôt reste permis, on
+   * le rattachera plus tard depuis l'application.
+   */
+  const probe = React.useCallback(async (): Promise<boolean> => {
+    const typed =
+      mode === "link"
+        ? (repoRef.current?.value ?? "").trim()
+        : (nameRef.current?.value ?? "").trim();
+    if (!typed) {
+      setState(null);
+      onResolved?.("");
+      onCreateRequest?.(null);
+      return true;
+    }
+
     const data = new FormData();
     data.set("mode", mode);
     if (mode === "link") {
-      data.set("repo", repoRef.current?.value ?? "");
+      data.set("repo", typed);
     } else {
       data.set("owner", ownerRef.current?.value ?? "");
-      data.set("repo_name", nameRef.current?.value ?? "");
+      data.set("repo_name", typed);
       if (privateRef.current?.checked) data.set("private", "true");
     }
-    startTransition(async () => {
-      const res = await gitProbeAction(null, data);
-      setState(res);
-      // L'étape « pipeline » a besoin du dépôt : le remonter ici évite au
-      // parent de relire un champ caché.
-      if (res?.ok && res.repo) onResolved?.(res.repo);
-    });
-  }
+
+    const res = await gitProbeAction(null, data);
+    setState(res);
+    if (!res?.ok || !res.repo) return false;
+
+    onResolved?.(res.repo);
+    onCreateRequest?.(
+      mode === "create"
+        ? {
+            owner: ownerRef.current?.value ?? "",
+            name: typed,
+            private: privateRef.current?.checked ?? false,
+          }
+        : null,
+    );
+    return true;
+  }, [mode, onResolved, onCreateRequest]);
+
+  // Le parent déclenche la vérification depuis « Continuer ».
+  React.useEffect(() => {
+    onReady?.(probe);
+  }, [onReady, probe]);
 
   // La référence validée alimente le champ caché du formulaire parent : aucun
   // état à remonter, le FormData la portera.
@@ -230,14 +277,6 @@ export function GitStep({
                 className="font-mono"
               />
             </div>
-            <Button type="button" disabled={pending} onClick={probe}>
-              {pending ? (
-                <Loader2 className="size-3.5 animate-spin" />
-              ) : (
-                <Link2 className="size-3.5" />
-              )}
-              Rattacher
-            </Button>
           </div>
         ) : (
           <div className="flex flex-col gap-3">
@@ -263,15 +302,6 @@ export function GitStep({
                   className="font-mono"
                 />
               </div>
-
-              <Button type="button" disabled={pending} onClick={probe}>
-                {pending ? (
-                  <Loader2 className="size-3.5 animate-spin" />
-                ) : (
-                  <Plus className="size-3.5" />
-                )}
-                Créer
-              </Button>
             </div>
 
             <label className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -298,29 +328,18 @@ export function GitStep({
         )}
       </div>
 
-      {/* Sans confirmation visible, on quitte l'étape en croyant le dépôt
-          rattaché : le bouton de création ne valide que lui-même. */}
-      {resolved ? (
+      {resolved && (
         <p className="flex items-center gap-2 rounded-md border border-success/30 bg-success/5 px-3 py-2 text-xs text-success">
           <Check className="size-3.5 shrink-0" />
           <span>
-            <strong className="font-medium">{resolved}</strong> sera rattaché à
-            l&apos;application.
-          </span>
-        </p>
-      ) : (
-        <p className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/5 px-3 py-2 text-xs text-warning">
-          <TriangleAlert className="mt-0.5 size-3.5 shrink-0" />
-          <span>
-            Aucun dépôt retenu.{" "}
+            <strong className="font-medium">{resolved}</strong>{" "}
             {mode === "create"
-              ? "Cliquez sur « Créer le dépôt » pour qu'il soit créé et rattaché."
-              : "Cliquez sur « Vérifier » pour rattacher un dépôt existant."}{" "}
-            Sinon, l&apos;application sera créée sans dépôt — vous pourrez le
-            rattacher plus tard.
+              ? "sera créé et rattaché à la validation."
+              : "sera rattaché à l'application."}
           </span>
         </p>
       )}
+
     </div>
   );
 }

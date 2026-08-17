@@ -6,6 +6,7 @@ import { Check, Loader2, Upload, XCircle } from "lucide-react";
 import { writeRepoFilesAction, type ActionState } from "@/app/actions";
 import type { FileTemplate, TemplateFolder } from "@/lib/api";
 import { FilesStep, buildFiles } from "@/components/files-step";
+import type { CustomFile } from "@/components/custom-file-dialog";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -32,16 +33,22 @@ export function AppFiles({
   folders: TemplateFolder[];
 }) {
   const [selected, setSelected] = useState<string[]>([]);
+  const [custom, setCustom] = useState<CustomFile[]>([]);
   const [state, setState] = useState<ActionState>(null);
   const [pending, startTransition] = useTransition();
 
   function write() {
-    const { files, needsToken } = buildFiles(templates, selected, {
-      app: appName,
-      repo,
-      env: "production",
-      endpoint: `${baseUrl}/api/v1/apps/${appId}/deploy`,
-    });
+    const { files, needsToken } = buildFiles(
+      templates,
+      selected,
+      {
+        app: appName,
+        repo,
+        env: "production",
+        endpoint: `${baseUrl}/api/v1/apps/${appId}/deploy`,
+      },
+      custom,
+    );
 
     const data = new FormData();
     data.set("repo", repo);
@@ -63,15 +70,17 @@ export function AppFiles({
         folders={folders}
         selected={selected}
         onChange={setSelected}
+        custom={custom}
+        onCustomChange={setCustom}
       />
 
-      {templates.length > 0 && (
+      {(templates.length > 0 || custom.length > 0) && (
         <div>
           <Button
             type="button"
             variant="outline"
             size="sm"
-            disabled={pending || selected.length === 0}
+            disabled={pending || selected.length + custom.length === 0}
             onClick={write}
           >
             {pending ? (
