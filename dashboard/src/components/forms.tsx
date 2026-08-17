@@ -49,6 +49,7 @@ export function SubmitButton({
   size = "default",
   icon: Icon,
   disabled,
+  ariaLabel,
 }: {
   label: string;
   pendingLabel?: string;
@@ -58,7 +59,9 @@ export function SubmitButton({
   confirmTitle?: string;
   confirmLabel?: string;
   variant?: "default" | "outline" | "secondary" | "ghost" | "destructive";
-  size?: "default" | "sm" | "xs" | "lg";
+  size?: "default" | "sm" | "xs" | "lg" | "icon-sm" | "icon-xs";
+  /** Nom accessible quand le bouton n'a pas de libellé. */
+  ariaLabel?: string;
   icon?: React.ComponentType<{ className?: string }>;
   /** Bloque la soumission tant qu'une condition n'est pas remplie. */
   disabled?: boolean;
@@ -68,11 +71,17 @@ export function SubmitButton({
   const { pending } = useFormStatus();
   const [asking, setAsking] = React.useState(false);
   const ref = React.useRef<HTMLButtonElement>(null);
+  // Le clic de confirmation traverse la garde par cette ref, pas par l'état :
+  // `asking` est lu dans la closure du rendu courant, dont la valeur au moment
+  // du clic programmé dépend de l'ordre des rendus. La modale se rouvrait donc
+  // au lieu de soumettre, indéfiniment.
+  const confirmed = React.useRef(false);
 
   const button = (
     <Button
       ref={ref}
       type="submit"
+      aria-label={ariaLabel}
       disabled={pending || disabled}
       variant={variant}
       size={size}
@@ -80,10 +89,16 @@ export function SubmitButton({
       onClick={(e) => {
         // La confirmation passe par une modale : `window.confirm` bloque le
         // navigateur et ne peut ni être stylé ni détailler la portée du geste.
-        if (confirm && !asking) {
-          e.preventDefault();
-          setAsking(true);
+        if (!confirm) return;
+
+        if (confirmed.current) {
+          // Le geste a été confirmé : on laisse le formulaire partir, et la
+          // garde se rearme pour la soumission suivante.
+          confirmed.current = false;
+          return;
         }
+        e.preventDefault();
+        setAsking(true);
       }}
     >
       {pending ? (
@@ -120,12 +135,11 @@ export function SubmitButton({
               type="button"
               variant={variant === "default" ? "default" : variant}
               onClick={() => {
-                // La modale se ferme d'abord : le clic suivant sur le bouton
-                // d'origine traverse, `asking` étant retombé à faux.
                 setAsking(false);
                 // Le formulaire est soumis via le bouton réel pour que
                 // `useFormStatus` et la Server Action restent branchés.
-                requestAnimationFrame(() => ref.current?.click());
+                confirmed.current = true;
+                ref.current?.click();
               }}
             >
               {Icon ? <Icon className="size-3.5" /> : null}
