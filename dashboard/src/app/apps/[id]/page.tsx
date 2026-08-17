@@ -13,6 +13,7 @@ import {
   Network,
   Rocket,
   Settings2,
+  Variable,
   Terminal,
 } from "lucide-react";
 
@@ -20,6 +21,7 @@ import { api, publicApiUrl, type Deployment, type GitRun } from "@/lib/api";
 import { DeployDialog } from "@/components/deploy-dialog";
 import { CiOnboardingDialog } from "@/components/ci-onboarding";
 import { AppSettings } from "@/components/app-settings";
+import { RepoConfig } from "@/components/repo-config";
 import { RunBadge } from "@/components/run-badge";
 import { AutoRefresh } from "@/components/auto-refresh";
 import {
@@ -49,6 +51,7 @@ const TABS = [
   ["apercu", "Vue d'ensemble", Layers],
   ["docs", "Documentation", BookText],
   ["pipeline", "Pipeline", GitBranch],
+  ["configuration", "Configuration", Variable],
   ["parametres", "Paramètres", Settings2],
 ] as const;
 
@@ -64,10 +67,10 @@ export default async function AppDetail({
   searchParams,
 }: {
   params: Promise<{ id: string }>;
-  searchParams: Promise<{ tab?: string; file?: string }>;
+  searchParams: Promise<{ tab?: string; file?: string; env?: string }>;
 }) {
   const { id } = await params;
-  const { tab, file } = await searchParams;
+  const { tab, file, env: repoEnv } = await searchParams;
   const activeTab = TABS.some(([k]) => k === tab) ? tab! : "apercu";
 
   if (!(await api.me().catch(() => null))) redirect("/login");
@@ -110,6 +113,18 @@ export default async function AppDetail({
 
   // Les modèles ne servent que sur l'onglet paramètres, où l'on écrit dans le
   // dépôt.
+  // Variables et secrets viennent tous deux de GitHub : une seule source, pas
+  // de copie locale à tenir à jour.
+  const scope = (repoEnv ?? "").trim();
+  const [repoVars, repoSecrets, repoEnvs] =
+    activeTab === "configuration" && app.git_repo
+      ? await Promise.all([
+          api.listRepoVars(id, scope).catch(() => []),
+          api.listRepoSecrets(id, scope).catch(() => []),
+          api.listRepoEnvs(id).catch(() => []),
+        ])
+      : [[], [], []];
+
   const [templates, folders] =
     activeTab === "parametres"
       ? await Promise.all([
@@ -423,6 +438,27 @@ export default async function AppDetail({
       )}
 
       {/* ------------------------------------------------------------------ */}
+      {activeTab === "configuration" && (
+        app.git_repo ? (
+          <RepoConfig
+            appId={id}
+            repo={app.git_repo}
+            variables={repoVars}
+            secretNames={repoSecrets.map((s) => s.name)}
+            env={scope}
+            environments={repoEnvs}
+          />
+        ) : (
+          <Card title="Configuration" icon={Variable}>
+            <EmptyState
+              icon={GitBranch}
+              title="Aucun dépôt rattaché"
+              description="Les variables et secrets vivent sur le dépôt Git. Rattachez-en un depuis les paramètres."
+            />
+          </Card>
+        )
+      )}
+
       {activeTab === "parametres" && (
         <AppSettings
           app={app}

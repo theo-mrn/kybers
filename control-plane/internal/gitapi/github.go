@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -407,7 +408,242 @@ func (c *Client) fileSHA(ctx context.Context, fullName, path string) (string, er
 //
 // GitHub impose un chiffrement à clé publique (libsodium sealed box) : le
 // secret ne transite jamais en clair, même vers son API.
+// Secret d'un dépôt : son nom et sa date, jamais sa valeur.
+type Secret struct {
+	Name      string    `json:"name"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// ListSecrets retourne les secrets Actions du dépôt.
+//
+// GitHub ne renvoie jamais les valeurs — elles sont chiffrées pour une clé que
+// seul le runner détient. Les noms suffisent à savoir ce que le CI connaît, et
+// c'est la seule chose que Kybers puisse en dire.
+// Variable d'un dépôt : contrairement au secret, sa valeur est lisible.
+type Variable struct {
+	Name      string    `json:"name"`
+	Value     string    `json:"value"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// ListVariables retourne les variables Actions du dépôt, valeurs comprises.
+//
+// GitHub les distingue des secrets : une variable n'est pas chiffrée, elle est
+// faite pour être relue. C'est ce qui permet de les afficher telles quelles.
+func (c *Client) ListVariables(ctx context.Context, fullName string) ([]Variable, error) {
+	var payload struct {
+		Variables []struct {
+			Name      string `json:"name"`
+			Value     string `json:"value"`
+			UpdatedAt string `json:"updated_at"`
+		} `json:"variables"`
+	}
+	if err := c.get(ctx, "/repos/"+fullName+"/actions/variables?per_page=100", &payload); err != nil {
+		return nil, err
+	}
+
+	out := make([]Variable, 0, len(payload.Variables))
+	for _, v := range payload.Variables {
+		ts, _ := time.Parse(time.RFC3339, v.UpdatedAt)
+		out = append(out, Variable{Name: v.Name, Value: v.Value, UpdatedAt: ts})
+	}
+	return out, nil
+}
+
+// PutVariable crée ou met à jour une variable du dépôt.
+//
+// L'API distingue création (POST) et mise à jour (PATCH) : on tente la
+// création, et on bascule si elle existe déjà.
+func (c *Client) PutVariable(ctx context.Context, fullName, name, value string) error {
+	token, apiURL := c.credentials(ctx)
+	if token == "" {
+		return ErrNotConfigured
+	}
+
+	base := apiURL + "/repos/" + fullName + "/actions/variables"
+	body := map[string]any{"name": name, "value": value}
+
+	err := c.sendJSON(ctx, http.MethodPost, base, body, nil)
+	if err == nil {
+		return nil
+	}
+	// Déjà présente : l'API refuse la création, la mise à jour porte le nom
+	// dans l'URL et non dans le corps.
+	return c.sendJSON(ctx, http.MethodPatch, base+"/"+name,
+		map[string]any{"name": name, "value": value}, nil)
+}
+
+// DeleteVariable retire une variable du dépôt.
+func (c *Client) DeleteVariable(ctx context.Context, fullName, name string) error {
+	return c.sendJSON(ctx, http.MethodDelete,
+		c.apiBase(ctx)+"/repos/"+fullName+"/actions/variables/"+name, nil, nil)
+}
+
+// DeleteSecret retire un secret du dépôt.
+func (c *Client) DeleteSecret(ctx context.Context, fullName, name string) error {
+	return c.sendJSON(ctx, http.MethodDelete,
+		c.apiBase(ctx)+"/repos/"+fullName+"/actions/secrets/"+name, nil, nil)
+}
+
+// apiBase retourne l'URL de l'API pour la requête courante.
+func (c *Client) apiBase(ctx context.Context) string {
+	_, apiURL := c.credentials(ctx)
+	return apiURL
+}
+
+func (c *Client) ListSecrets(ctx context.Context, fullName string) ([]Secret, error) {
+	var payload struct {
+		Secrets []struct {
+			Name      string `json:"name"`
+			UpdatedAt string `json:"updated_at"`
+		} `json:"secrets"`
+	}
+	if err := c.get(ctx, "/repos/"+fullName+"/actions/secrets?per_page=100", &payload); err != nil {
+		return nil, err
+	}
+
+	out := make([]Secret, 0, len(payload.Secrets))
+	for _, s := range payload.Secrets {
+		// Une date illisible ne justifie pas de perdre le nom : c'est lui qui
+		// porte l'information utile.
+		ts, _ := time.Parse(time.RFC3339, s.UpdatedAt)
+		out = append(out, Secret{Name: s.Name, UpdatedAt: ts})
+	}
+	return out, nil
+}
+
+// PutSecret dépose un secret au niveau du dépôt.
+//
+// Il est alors visible par tous les workflows, quel que soit l'environnement
+// visé : réservé à ce qui est réellement commun, comme un jeton de registre.
 func (c *Client) PutSecret(ctx context.Context, fullName, name, value string) error {
+	return c.putSecretIn(ctx, "/repos/"+fullName+"/actions", name, value)
+}
+
+// PutEnvSecret dépose un secret dans un environnement du dépôt.
+//
+// C'est le cloisonnement qu'attend un déploiement : le secret de production
+// n'est pas lisible par un workflow visant la recette. L'environnement est
+// créé s'il n'existe pas — sinon la première écriture échouerait sur un
+// environnement que personne n'a pensé à déclarer.
+func (c *Client) PutEnvSecret(ctx context.Context, fullName, env, name, value string) error {
+	if err := c.EnsureEnvironment(ctx, fullName, env); err != nil {
+		return err
+	}
+	return c.putSecretIn(ctx,
+		"/repos/"+fullName+"/environments/"+url.PathEscape(env), name, value)
+}
+
+// EnsureEnvironment crée l'environnement s'il n'existe pas.
+//
+// L'appel est idempotent côté GitHub : recréer un environnement existant ne
+// perd ni ses secrets ni ses règles de protection.
+func (c *Client) EnsureEnvironment(ctx context.Context, fullName, env string) error {
+	return c.sendJSON(ctx, http.MethodPut,
+		c.apiBase(ctx)+"/repos/"+fullName+"/environments/"+url.PathEscape(env),
+		map[string]any{}, nil)
+}
+
+// DeleteEnvironment supprime un environnement et tout ce qu'il contient.
+//
+// GitHub emporte ses secrets et ses variables : l'opération est définitive, et
+// les valeurs ne sont récupérables nulle part.
+func (c *Client) DeleteEnvironment(ctx context.Context, fullName, env string) error {
+	return c.sendJSON(ctx, http.MethodDelete,
+		c.apiBase(ctx)+"/repos/"+fullName+"/environments/"+url.PathEscape(env),
+		nil, nil)
+}
+
+// ListEnvironments retourne les environnements déclarés sur le dépôt.
+func (c *Client) ListEnvironments(ctx context.Context, fullName string) ([]string, error) {
+	var payload struct {
+		Environments []struct {
+			Name string `json:"name"`
+		} `json:"environments"`
+	}
+	if err := c.get(ctx, "/repos/"+fullName+"/environments", &payload); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(payload.Environments))
+	for _, e := range payload.Environments {
+		out = append(out, e.Name)
+	}
+	return out, nil
+}
+
+// ListEnvSecrets retourne les noms des secrets d'un environnement.
+func (c *Client) ListEnvSecrets(ctx context.Context, fullName, env string) ([]Secret, error) {
+	var payload struct {
+		Secrets []struct {
+			Name      string `json:"name"`
+			UpdatedAt string `json:"updated_at"`
+		} `json:"secrets"`
+	}
+	if err := c.get(ctx, "/repos/"+fullName+"/environments/"+url.PathEscape(env)+
+		"/secrets?per_page=100", &payload); err != nil {
+		return nil, err
+	}
+	out := make([]Secret, 0, len(payload.Secrets))
+	for _, s := range payload.Secrets {
+		ts, _ := time.Parse(time.RFC3339, s.UpdatedAt)
+		out = append(out, Secret{Name: s.Name, UpdatedAt: ts})
+	}
+	return out, nil
+}
+
+// ListEnvVariables retourne les variables d'un environnement, valeurs comprises.
+func (c *Client) ListEnvVariables(ctx context.Context, fullName, env string) ([]Variable, error) {
+	var payload struct {
+		Variables []struct {
+			Name      string `json:"name"`
+			Value     string `json:"value"`
+			UpdatedAt string `json:"updated_at"`
+		} `json:"variables"`
+	}
+	if err := c.get(ctx, "/repos/"+fullName+"/environments/"+url.PathEscape(env)+
+		"/variables?per_page=100", &payload); err != nil {
+		return nil, err
+	}
+	out := make([]Variable, 0, len(payload.Variables))
+	for _, v := range payload.Variables {
+		ts, _ := time.Parse(time.RFC3339, v.UpdatedAt)
+		out = append(out, Variable{Name: v.Name, Value: v.Value, UpdatedAt: ts})
+	}
+	return out, nil
+}
+
+// PutEnvVariable crée ou met à jour une variable d'environnement.
+func (c *Client) PutEnvVariable(ctx context.Context, fullName, env, name, value string) error {
+	if err := c.EnsureEnvironment(ctx, fullName, env); err != nil {
+		return err
+	}
+	base := c.apiBase(ctx) + "/repos/" + fullName + "/environments/" +
+		url.PathEscape(env) + "/variables"
+	body := map[string]any{"name": name, "value": value}
+
+	if err := c.sendJSON(ctx, http.MethodPost, base, body, nil); err == nil {
+		return nil
+	}
+	return c.sendJSON(ctx, http.MethodPatch, base+"/"+name, body, nil)
+}
+
+// DeleteEnvSecret retire un secret d'un environnement.
+func (c *Client) DeleteEnvSecret(ctx context.Context, fullName, env, name string) error {
+	return c.sendJSON(ctx, http.MethodDelete, c.apiBase(ctx)+"/repos/"+fullName+
+		"/environments/"+url.PathEscape(env)+"/secrets/"+name, nil, nil)
+}
+
+// DeleteEnvVariable retire une variable d'un environnement.
+func (c *Client) DeleteEnvVariable(ctx context.Context, fullName, env, name string) error {
+	return c.sendJSON(ctx, http.MethodDelete, c.apiBase(ctx)+"/repos/"+fullName+
+		"/environments/"+url.PathEscape(env)+"/variables/"+name, nil, nil)
+}
+
+// putSecretIn chiffre puis dépose un secret sous le chemin donné.
+//
+// Le chiffrement est le même pour un dépôt et pour un environnement : seule la
+// clé publique diffère, et elle vient du chemin.
+func (c *Client) putSecretIn(ctx context.Context, scope, name, value string) error {
 	token, apiURL := c.credentials(ctx)
 	if token == "" {
 		return ErrNotConfigured
@@ -417,8 +653,8 @@ func (c *Client) PutSecret(ctx context.Context, fullName, name, value string) er
 		KeyID string `json:"key_id"`
 		Key   string `json:"key"`
 	}
-	if err := c.get(ctx, "/repos/"+fullName+"/actions/secrets/public-key", &key); err != nil {
-		return fmt.Errorf("clé publique du dépôt : %w", err)
+	if err := c.get(ctx, scope+"/secrets/public-key", &key); err != nil {
+		return fmt.Errorf("clé publique : %w", err)
 	}
 
 	pub, err := base64.StdEncoding.DecodeString(key.Key)
@@ -445,7 +681,7 @@ func (c *Client) PutSecret(ctx context.Context, fullName, name, value string) er
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
-		apiURL+"/repos/"+fullName+"/actions/secrets/"+name, strings.NewReader(string(body)))
+		apiURL+scope+"/secrets/"+name, strings.NewReader(string(body)))
 	if err != nil {
 		return err
 	}
@@ -464,8 +700,8 @@ func (c *Client) PutSecret(ctx context.Context, fullName, name, value string) er
 		if res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden ||
 			res.StatusCode == http.StatusNotFound {
 			return fmt.Errorf(
-				"secrets refusés sur %s : le jeton doit avoir « Secrets: write » (fine-grained) ou la portée « repo ». %s",
-				fullName, detail)
+				"secret refusé : le jeton doit avoir « Secrets: write » (fine-grained) ou la portée « repo ». %s",
+				detail)
 		}
 		return fmt.Errorf("dépôt du secret refusé (statut %d) : %s", res.StatusCode, detail)
 	}

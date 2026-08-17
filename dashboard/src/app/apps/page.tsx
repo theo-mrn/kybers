@@ -48,17 +48,21 @@ export default async function AppsPage({
 
   if (!(await api.me().catch(() => null))) redirect("/login");
 
-  const [apps, deployments, gitStatus, templates, folders] = await Promise.all([
-    api.listApps().catch(() => []),
-    api.listDeployments().catch(() => []),
-    // Conditionne ce que l'étape « dépôt » du parcours de création propose :
-    // rattacher, créer, ou prévenir que rien ne sera lu.
-    api.gitStatus().catch(() => ({ configured: false }) as GitStatus),
-    // Les modèles de l'organisation priment sur ceux de Kybers dans le
-    // parcours de création.
-    api.listTemplates().catch(() => []),
-    api.listFolders().catch(() => []),
-  ]);
+  const [apps, deployments, gitStatus, templates, folders, builtinPaths] =
+    await Promise.all([
+      api.listApps().catch(() => []),
+      api.listDeployments().catch(() => []),
+      // Conditionne ce que l'étape « dépôt » du parcours de création propose :
+      // rattacher, créer, ou prévenir que rien ne sera lu.
+      api.gitStatus().catch(() => ({ configured: false }) as GitStatus),
+      // Les modèles de l'organisation priment sur ceux de Kybers dans le
+      // parcours de création.
+      api.listTemplates().catch(() => []),
+      api.listFolders().catch(() => []),
+      // Types fournis avec Kybers : proposés même si l'organisation n'en a
+      // installé aucun, sinon le parcours s'ouvrirait sur une impasse.
+      api.listBuiltinGoldenPaths().catch(() => []),
+    ]);
 
   // Dernière révision de chaque environnement, par application : c'est ce qui
   // décrit l'état réel de l'application.
@@ -93,6 +97,7 @@ export default async function AppsPage({
             baseUrl={publicApiUrl}
             templates={templates}
             folders={folders}
+            builtinPaths={builtinPaths}
           />
       </PageHeader>
 
@@ -160,6 +165,7 @@ export default async function AppsPage({
             baseUrl={publicApiUrl}
             templates={templates}
             folders={folders}
+            builtinPaths={builtinPaths}
           />
             </EmptyState>
           )

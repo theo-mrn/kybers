@@ -35,19 +35,170 @@ function fail(e: unknown, fallback: string): ActionState {
 // Applications
 // ---------------------------------------------------------------------------
 
-export async function createAppAction(
-  _prev: ActionState,
-  formData: FormData,
-): Promise<ActionState> {
-  // Le nom préfixe les namespaces Kubernetes : il doit en respecter la
-  // syntaxe, quelle que soit la saisie.
-  const name = String(formData.get("name") ?? "")
+/**
+ * Normalise un nom d'application.
+ *
+ * Il préfixe les namespaces Kubernetes : il doit en respecter la syntaxe,
+ * quelle que soit la saisie.
+ */
+function sanitizeAppName(v: string) {
+  return v
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9-]/g, "-")
     .replace(/-{2,}/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 40);
+}
+
+/**
+ * Crée l'application, son dépôt et ses fichiers en une seule validation.
+ *
+ * Le parcours écrivait au fil des étapes : dépôt créé à l'étape « dépôt »,
+ * application à la suivante, fichiers à la fin. Abandonner en cours laissait
+ * donc un dépôt vide et une application orpheline sur le compte de
+ * l'utilisateur. Tout est désormais préparé côté client et joué ici.
+ *
+ * L'ordre est contraint : l'application doit exister avant les fichiers, car
+ * le workflow porte l'URL de déploiement, qui contient son identifiant. Chaque
+ * étape franchie est donc compensée si la suivante échoue — on ne laisse pas
+ * derrière soi ce que l'utilisateur n'a pas obtenu.
+ */
+export async function createAppBundleAction(input: {
+  name: string;
+  containerPort: number;
+  extraPorts: number[];
+  /** Dépôt à rattacher, ou à créer quand `createRepo` est fourni. */
+  repo: string;
+  createRepo?: {
+    owner: string;
+    name: string;
+    description: string;
+    private: boolean;
+  };
+  /** Modèles retenus ; `{{endpoint}}` est substitué ici, l'id étant enfin connu. */
+  files: { path: string; content: string }[];
+  needsToken: boolean;
+  baseUrl: string;
+  /** Injectées dans le conteneur au déploiement. */
+  envVars?: { key: string; value: string }[];
+  /** Écrits chiffrés sur le dépôt, pour le CI. */
+  secrets?: { key: string; value: string }[];
+}): Promise<ActionState> {
+  const name = sanitizeAppName(input.name);
+  if (!name) return { ok: false, message: "Le nom de l'application est requis." };
+
+  // 1. Le dépôt d'abord : c'est la seule étape qu'on ne peut pas défaire
+  // partout, supprimer un dépôt exigeant le scope `delete_repo`.
+  let repo = input.repo.trim();
+  let repoCreated = false;
+
+  if (input.createRepo) {
+    try {
+      const created = await api.gitCreateRepo(input.createRepo);
+      repo = created.full_name;
+      repoCreated = true;
+    } catch (e) {
+      return fail(e, "Échec de la création du dépôt.");
+    }
+  }
+
+  // 2. L'application, dont l'identifiant alimente l'URL de déploiement.
+  let appId: string;
+  try {
+    const app = await api.createApp(name, repo, input.containerPort || 8080);
+    appId = app.id;
+  } catch (e) {
+    // Le dépôt vient d'être créé et restera vide : le dire, plutôt que de le
+    // supprimer avec un droit que le jeton n'a pas toujours.
+    const why = e instanceof Error ? e.message : "Échec de la création.";
+    return {
+      ok: false,
+      message:
+        why + (repoCreated ? ` Le dépôt ${repo} a été créé et reste vide.` : ""),
+    };
+  }
+
+  // 3. Les ports secondaires : un refus ici ne remet pas l'application en
+  // cause, ils restent modifiables dans ses paramètres.
+  if (input.extraPorts.length > 0) {
+    const main = input.containerPort || 8080;
+    await api
+      .setAppPorts(appId, [
+        { port: main, name: "http", exposed: true, protocol: "TCP" },
+        ...input.extraPorts
+          .filter((p) => p !== main)
+          .map((p) => ({
+            port: p,
+            name: `port-${p}`,
+            exposed: false,
+            protocol: "TCP",
+          })),
+      ])
+      .catch(() => {});
+  }
+
+  // 4. Les variables d'exécution : elles appartiennent à l'environnement, pas
+  // au dépôt. Un refus ne remet pas l'application en cause, elles restent
+  // modifiables dans ses paramètres.
+  if (input.envVars && input.envVars.length > 0) {
+    await api
+      .setEnv(
+        appId,
+        "production",
+        Object.fromEntries(input.envVars.map((v) => [v.key, v.value])),
+      )
+      .catch(() => {});
+  }
+
+  // 5. Les fichiers et les secrets, avec l'identifiant enfin connu. Des
+  // secrets sans fichier restent légitimes : le dépôt peut déjà porter son
+  // workflow.
+  const secrets = input.secrets ?? [];
+  if (repo && (input.files.length > 0 || secrets.length > 0)) {
+    const endpoint = `${input.baseUrl}/api/v1/apps/${appId}/deploy`;
+    const files = input.files.map((f) => ({
+      path: f.path.replaceAll("{{endpoint}}", endpoint),
+      content: f.content.replaceAll("{{endpoint}}", endpoint),
+    }));
+
+    // L'utilisateur n'a pas obtenu ce qu'il demandait : on ne lui laisse pas
+    // une application à moitié installée.
+    const undo = async (message: string): Promise<ActionState> => {
+      await api.deleteApp(appId, true, false).catch(() => {});
+      return {
+        ok: false,
+        message: `${message} L'application n'a pas été créée.`,
+      };
+    };
+
+    try {
+      // L'écriture est atomique côté serveur : un refus remonte en erreur,
+      // il n'y a plus d'échec partiel à recoller.
+      await api.gitWriteFiles({
+        repo,
+        files,
+        token_name: input.needsToken ? `ci-${name}` : undefined,
+        // Sans dépôt, ce bloc n'est pas atteint : les secrets seraient perdus
+        // en silence, l'étape le signale donc à la saisie.
+        secrets: input.secrets,
+      });
+    } catch (e) {
+      return undo(
+        e instanceof Error ? e.message : "Échec de l'écriture des fichiers.",
+      );
+    }
+  }
+
+  revalidatePath("/apps");
+  return { ok: true, message: `Application « ${name} » créée.`, id: appId };
+}
+
+export async function createAppAction(
+  _prev: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const name = sanitizeAppName(String(formData.get("name") ?? ""));
   const gitRepo = String(formData.get("git_repo") ?? "").trim();
   const port = Number(formData.get("container_port") ?? 8080);
   // Ports secondaires : joignables dans le cluster, non routés par l'Ingress.
@@ -641,18 +792,27 @@ export async function gitProbeAction(
   try {
     if (mode === "create") {
       if (!name) return { ok: false, message: "Nommez le dépôt à créer." };
-      const created = await api.gitCreateRepo({
-        owner,
-        name,
-        description: String(formData.get("description") ?? "").trim(),
-        private: String(formData.get("private") ?? "") === "true",
-      });
+      const full = owner ? `${owner}/${name}` : name;
+
+      // Rien n'est créé ici : le dépôt naît à la validation finale du
+      // parcours, avec l'application et ses fichiers. On vérifie seulement que
+      // le nom est libre, pour ne pas laisser découvrir le conflit à la fin.
+      const taken = await api
+        .gitLookup(full)
+        .then(() => true)
+        .catch(() => false);
+
+      if (taken) {
+        return {
+          ok: false,
+          message: `« ${full} » existe déjà. Choisissez un autre nom, ou rattachez ce dépôt.`,
+        };
+      }
+
       return {
         ok: true,
-        message: `Dépôt « ${created.full_name} » créé.`,
-        repo: created.full_name,
-        url: created.html_url,
-        language: created.language,
+        message: `« ${full} » est disponible. Il sera créé à la validation.`,
+        repo: full,
         created: true,
       };
     }
@@ -766,15 +926,200 @@ export async function saveFolderAction(
   const id = String(formData.get("id") ?? "").trim();
   const name = String(formData.get("name") ?? "").trim();
   const description = String(formData.get("description") ?? "").trim();
+  const isGoldenPath = String(formData.get("is_golden_path") ?? "") === "true";
 
   if (!name) return { ok: false, message: "Nommez ce dossier." };
 
+  const num = (key: string) => {
+    const n = Number(String(formData.get(key) ?? "").trim());
+    return Number.isInteger(n) && n > 0 ? n : 0;
+  };
+
   try {
-    const saved = await api.saveFolder({ id: id || undefined, name, description });
+    // Ces champs ne sont pas dans le formulaire — ils viennent de l'image de
+    // base, pas d'une décision d'équipe. Les relire évite de les vider.
+    const existing = id
+      ? await api
+          .listFolders()
+          .then((all) => all.find((f) => f.id === id))
+          .catch(() => undefined)
+      : undefined;
+
+    const saved = await api.saveFolder({
+      id: id || undefined,
+      name,
+      description,
+      // Un dossier ordinaire garde des réglages vides : ils ne servent qu'aux
+      // types, et les écrire quand même les ferait apparaître à tort.
+      is_golden_path: isGoldenPath,
+      runtime_image: String(formData.get("runtime_image") ?? "").trim(),
+      // Filtre sur les versions publiées, pas liste de substitution.
+      versions: String(formData.get("versions") ?? "").trim(),
+      default_port: num("default_port"),
+      memory_request: String(formData.get("memory_request") ?? "").trim(),
+      memory_limit: String(formData.get("memory_limit") ?? "").trim(),
+      probe_path: String(formData.get("probe_path") ?? "").trim(),
+      // Ces valeurs viennent de l'image de base ou d'un réglage fin : elles ne
+      // sont pas saisies, mais doivent survivre à une modification du dossier.
+      default_version: existing?.default_version ?? "",
+      probe_initial_delay: existing?.probe_initial_delay ?? 0,
+      icon: existing?.icon ?? "",
+      cpu_request: existing?.cpu_request ?? "",
+      cpu_limit: existing?.cpu_limit ?? "",
+      run_as_user: existing?.run_as_user ?? 0,
+    });
     revalidatePath("/", "layout");
     return { ok: true, message: `Dossier « ${saved.name} » enregistré.`, id: saved.id };
   } catch (e) {
     return fail(e, "Échec de l'enregistrement.");
+  }
+}
+
+/**
+ * Dépose des secrets sur le dépôt rattaché.
+ *
+ * Rien n'est conservé côté Kybers : GitHub ne restitue jamais une valeur, en
+ * garder une copie créerait un second exemplaire à protéger sans rien
+ * apporter. Seuls les noms sont relus ensuite.
+ */
+export async function putRepoSecretsAction(
+  _prev: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const appId = String(formData.get("app_id") ?? "");
+  const env = String(formData.get("env") ?? "").trim();
+  const parsed = parseEnvBlock(String(formData.get("vars") ?? ""));
+  const secrets = Object.entries(parsed).map(([key, value]) => ({ key, value }));
+  if (secrets.length === 0) {
+    return { ok: false, message: "Aucune paire KEY=VALUE valide." };
+  }
+
+  try {
+    const res = await api.putRepoSecrets(appId, secrets, env);
+    revalidatePath("/", "layout");
+    return ok(
+      `${res.written.length} secret(s) déposé(s) sur ${res.repo}.`,
+    );
+  } catch (e) {
+    return fail(e, "Échec du dépôt des secrets.");
+  }
+}
+
+/** Dépose des variables Actions sur le dépôt rattaché. */
+export async function putRepoVarsAction(
+  _prev: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const appId = String(formData.get("app_id") ?? "");
+  const env = String(formData.get("env") ?? "").trim();
+  const parsed = parseEnvBlock(String(formData.get("vars") ?? ""));
+  const variables = Object.entries(parsed).map(([key, value]) => ({
+    key,
+    value,
+  }));
+  if (variables.length === 0) {
+    return { ok: false, message: "Aucune paire KEY=VALUE valide." };
+  }
+
+  try {
+    const res = await api.putRepoVars(appId, variables, env);
+    revalidatePath("/", "layout");
+    return ok(`${res.written.length} variable(s) déposée(s) sur ${res.repo}.`);
+  } catch (e) {
+    return fail(e, "Échec du dépôt des variables.");
+  }
+}
+
+/**
+ * Déclare un environnement sur le dépôt.
+ *
+ * GitHub le crée à la volée au premier secret, mais le préparer d'avance
+ * permet de poser le cloisonnement avant d'avoir une valeur à y mettre.
+ */
+export async function createRepoEnvAction(
+  appId: string,
+  name: string,
+): Promise<ActionState> {
+  const clean = name.trim();
+  if (!clean) return { ok: false, message: "Nommez l'environnement." };
+
+  try {
+    await api.createRepoEnv(appId, clean);
+    revalidatePath("/", "layout");
+    return { ok: true, message: `Environnement « ${clean} » créé.` };
+  } catch (e) {
+    return fail(e, "Échec de la création.");
+  }
+}
+
+/**
+ * Supprime un environnement du dépôt.
+ *
+ * GitHub emporte ses secrets et ses variables : l'opération est définitive, et
+ * les valeurs ne sont récupérables nulle part.
+ */
+export async function deleteRepoEnvAction(
+  appId: string,
+  name: string,
+): Promise<ActionState> {
+  try {
+    await api.deleteRepoEnv(appId, name);
+    revalidatePath("/", "layout");
+    return ok(`Environnement « ${name} » supprimé.`);
+  } catch (e) {
+    return fail(e, "Échec de la suppression.");
+  }
+}
+
+/** Retire une variable ou un secret du dépôt. */
+export async function deleteRepoEntryAction(
+  appId: string,
+  name: string,
+  kind: "var" | "secret",
+  env = "",
+): Promise<ActionState> {
+  try {
+    if (kind === "secret") await api.deleteRepoSecret(appId, name, env);
+    else await api.deleteRepoVar(appId, name, env);
+    revalidatePath("/", "layout");
+    return ok(`${name} retiré du dépôt.`);
+  } catch (e) {
+    return fail(e, "Échec de la suppression.");
+  }
+}
+
+/**
+ * Liste les versions disponibles pour un type.
+ *
+ * Appelée à la sélection : le registre est interrogé à ce moment, pas au
+ * chargement de la page, pour ne pas payer un appel réseau qu'on n'utilisera
+ * peut-être jamais.
+ */
+export async function listRuntimeVersionsAction(
+  folderId: string,
+  /** Ignore le filtre du type : sert à régler ce filtre. */
+  all = false,
+) {
+  return api
+    .listRuntimeVersions(folderId, all)
+    .catch(() => ({ versions: [], source: "" }));
+}
+
+/**
+ * Installe un type fourni avec Kybers.
+ *
+ * Une organisation créée avant leur existence, ou qui en a supprimé un, doit
+ * pouvoir le reprendre : le seed initial ne rejoue jamais.
+ */
+export async function installGoldenPathAction(
+  key: string,
+): Promise<ActionState> {
+  try {
+    const saved = await api.installGoldenPath(key);
+    revalidatePath("/", "layout");
+    return { ok: true, message: `« ${saved.name} » installé.`, id: saved.id };
+  } catch (e) {
+    return fail(e, "Échec de l'installation.");
   }
 }
 
@@ -903,16 +1248,6 @@ export async function writeRepoFilesAction(
       token_name: needsToken ? `ci-${appName || "kybers"}` : undefined,
     });
 
-    const failed = Object.entries(res.failures ?? {});
-    if (failed.length > 0) {
-      // Un échec partiel doit se voir : les fichiers écrits le restent.
-      return {
-        ok: false,
-        message: `${res.written.length} fichier(s) écrit(s). Échec sur ${failed
-          .map(([p, e]) => `${p} (${e})`)
-          .join(", ")}`,
-      };
-    }
     return ok(
       `${res.written.length} fichier(s) écrit(s) dans ${res.repo}${res.secret ? ", jeton déposé en secret" : ""}.`,
     );

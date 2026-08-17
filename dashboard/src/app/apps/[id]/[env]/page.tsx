@@ -310,7 +310,7 @@ export default async function EnvironmentPage({
 
           <Card
             title="Secrets"
-            description="Chiffrés en base, injectés via un Secret Kubernetes. Les valeurs ne sont jamais relues par l'interface."
+            description="Chiffrés en base, injectés dans le conteneur. Ceux que le CI doit connaître se déposent sur le dépôt, onglet Configuration."
             icon={KeyRound}
           >
             {secretKeys.keys.length > 0 ? (

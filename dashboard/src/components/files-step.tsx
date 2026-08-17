@@ -5,6 +5,7 @@ import { FileCode, TriangleAlert } from "lucide-react";
 
 import type { FileTemplate, TemplateFolder } from "@/lib/api";
 import { FilePicker } from "@/components/file-picker";
+import type { CustomFile } from "@/components/custom-file-dialog";
 
 /**
  * Applique les substitutions d'un modèle.
@@ -12,15 +13,22 @@ import { FilePicker } from "@/components/file-picker";
  * Elles portent sur le chemin comme sur le contenu : un modèle peut viser
  * `.github/workflows/{{app}}.yml`.
  */
-export function render(
-  text: string,
-  vars: { app: string; repo: string; env: string; endpoint: string },
-) {
+export type RenderVars = {
+  app: string;
+  repo: string;
+  env: string;
+  endpoint: string;
+  /** Version du runtime choisie ; vide hors golden path. */
+  version?: string;
+};
+
+export function render(text: string, vars: RenderVars) {
   return text
     .replaceAll("{{app}}", vars.app)
     .replaceAll("{{repo}}", vars.repo)
     .replaceAll("{{env}}", vars.env)
-    .replaceAll("{{endpoint}}", vars.endpoint);
+    .replaceAll("{{endpoint}}", vars.endpoint)
+    .replaceAll("{{version}}", vars.version ?? "");
 }
 
 /**
@@ -39,6 +47,8 @@ export function FilesStep({
   folders = [],
   selected,
   onChange,
+  custom = [],
+  onCustomChange,
 }: {
   repo: string;
   appId: string;
@@ -49,6 +59,9 @@ export function FilesStep({
   /** Identifiants retenus, portés par le parent qui déclenche l'écriture. */
   selected: string[];
   onChange: (ids: string[]) => void;
+  /** Fichiers ponctuels, hors bibliothèque. */
+  custom?: CustomFile[];
+  onCustomChange?: (files: CustomFile[]) => void;
 }) {
   if (!repo) {
     return (
@@ -60,7 +73,9 @@ export function FilesStep({
     );
   }
 
-  if (templates.length === 0) {
+  // Sans modèle, l'ajout manuel reste possible : n'afficher l'impasse que si
+  // rien du tout n'est offert.
+  if (templates.length === 0 && !onCustomChange) {
     return (
       <p className="flex items-start gap-2 rounded-md border border-border bg-muted/60 px-3 py-2 text-xs text-muted-foreground">
         <FileCode className="mt-0.5 size-3.5 shrink-0" />
@@ -87,9 +102,11 @@ export function FilesStep({
         onChange={onChange}
         renderPath={(p) => render(p, vars)}
         renderContent={(c) => render(c, vars)}
+        custom={custom}
+        onCustomChange={onCustomChange}
       />
 
-      {selected.length > 0 && (
+      {(selected.length > 0 || custom.length > 0) && (
         <p className="text-xs text-muted-foreground">
           Écrits dans{" "}
           <span className="font-mono text-foreground">{repo}</span> à la
@@ -104,16 +121,29 @@ export function FilesStep({
 export function buildFiles(
   templates: FileTemplate[],
   selected: string[],
-  vars: { app: string; repo: string; env: string; endpoint: string },
+  vars: RenderVars,
+  custom: CustomFile[] = [],
 ) {
   const chosen = templates.filter((t) => selected.includes(t.id));
+
   return {
-    files: chosen.map((t) => ({
-      path: render(t.path, vars),
-      content: render(t.content, vars),
-    })),
+    files: [
+      ...chosen.map((t) => ({
+        path: render(t.path, vars),
+        content: render(t.content, vars),
+      })),
+      // Les fichiers ponctuels subissent les mêmes substitutions : les en
+      // priver surprendrait, l'éditeur proposant les mêmes jetons.
+      ...custom.map((f) => ({
+        path: render(f.path, vars),
+        content: render(f.content, vars),
+      })),
+    ],
     // Seul un workflow a besoin du jeton : le créer sans raison encombrerait
-    // la liste des jetons.
-    needsToken: chosen.some((t) => t.kind === "pipeline"),
+    // la liste des jetons. Un fichier ponctuel visant `.github/workflows/`
+    // compte aussi — c'en est un, quelle que soit son origine.
+    needsToken:
+      chosen.some((t) => t.kind === "pipeline") ||
+      custom.some((f) => f.path.replace(/^\/+/, "").startsWith(".github/workflows/")),
   };
 }

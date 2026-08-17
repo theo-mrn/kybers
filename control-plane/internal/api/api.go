@@ -3,9 +3,10 @@ package api
 
 import (
 	_ "embed"
+	"errors"
 
-	"crypto/rand"
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -72,10 +73,10 @@ type InstallConfig struct {
 func New(database *db.DB, grpc *grpcserver.Server, log *slog.Logger,
 	hosts *hostname.Generator, install InstallConfig) *API {
 	return &API{
-		db:               database,
-		grpc:             grpc,
-		log:              log,
-		hub:              registryapi.New(),
+		db:   database,
+		grpc: grpc,
+		log:  log,
+		hub:  registryapi.New(),
 		git: gitapi.New(install.GitToken, install.GitAPIURL).
 			// Le jeton peut être posé depuis l'interface : sans cette
 			// résolution, il faudrait redémarrer pour qu'il prenne effet.
@@ -177,6 +178,9 @@ func (a *API) Routes() http.Handler {
 	mux.Handle("POST /api/v1/template-folders", a.requirePerm(a.saveFolder, auth.PermAppConfig))
 	mux.Handle("PUT /api/v1/template-folders/{id}", a.requirePerm(a.saveFolder, auth.PermAppConfig))
 	mux.Handle("DELETE /api/v1/template-folders/{id}", a.requirePerm(a.deleteFolder, auth.PermAppConfig))
+	mux.Handle("GET /api/v1/golden-paths/builtin", a.requirePerm(a.listBuiltinGoldenPaths, auth.PermAppRead))
+	mux.Handle("POST /api/v1/golden-paths/builtin/{key}", a.requirePerm(a.installGoldenPath, auth.PermAppConfig))
+	mux.Handle("GET /api/v1/template-folders/{id}/versions", a.requirePerm(a.listRuntimeVersions, auth.PermAppRead))
 	mux.Handle("GET /api/v1/templates", a.requirePerm(a.listTemplates, auth.PermAppRead))
 	mux.Handle("POST /api/v1/templates", a.requirePerm(a.saveTemplate, auth.PermAppConfig))
 	mux.Handle("PUT /api/v1/templates/{id}", a.requirePerm(a.saveTemplate, auth.PermAppConfig))
@@ -194,6 +198,15 @@ func (a *API) Routes() http.Handler {
 	mux.Handle("GET /api/v1/apps/{id}/docs", a.requirePerm(a.listAppDocs, auth.PermAppRead))
 	mux.Handle("GET /api/v1/apps/{id}/docs/{path...}", a.requirePerm(a.getAppDoc, auth.PermAppRead))
 	mux.Handle("GET /api/v1/apps/{id}/runs", a.requirePerm(a.listAppRuns, auth.PermAppRead))
+	mux.Handle("GET /api/v1/apps/{id}/repo-secrets", a.requirePerm(a.listRepoSecrets, auth.PermAppRead))
+	mux.Handle("PUT /api/v1/apps/{id}/repo-secrets", a.requirePerm(a.putRepoSecrets, auth.PermAppConfig))
+	mux.Handle("DELETE /api/v1/apps/{id}/repo-secrets/{name}", a.requirePerm(a.deleteRepoSecret, auth.PermAppConfig))
+	mux.Handle("GET /api/v1/apps/{id}/repo-vars", a.requirePerm(a.listRepoVars, auth.PermAppRead))
+	mux.Handle("PUT /api/v1/apps/{id}/repo-vars", a.requirePerm(a.putRepoVars, auth.PermAppConfig))
+	mux.Handle("DELETE /api/v1/apps/{id}/repo-vars/{name}", a.requirePerm(a.deleteRepoVar, auth.PermAppConfig))
+	mux.Handle("GET /api/v1/apps/{id}/repo-envs", a.requirePerm(a.listRepoEnvs, auth.PermAppRead))
+	mux.Handle("PUT /api/v1/apps/{id}/repo-envs/{name}", a.requirePerm(a.createRepoEnv, auth.PermAppConfig))
+	mux.Handle("DELETE /api/v1/apps/{id}/repo-envs/{name}", a.requirePerm(a.deleteRepoEnv, auth.PermAppConfig))
 	mux.Handle("GET /api/v1/apps/{id}/ports", a.requirePerm(a.listAppPorts, auth.PermAppRead))
 	mux.Handle("PUT /api/v1/apps/{id}/ports", a.requirePerm(a.setAppPorts, auth.PermAppConfig))
 	mux.Handle("POST /api/v1/apps/{id}/deploy", a.requirePerm(a.deploy, auth.PermAppDeploy))
@@ -1371,6 +1384,253 @@ func (a *API) getAppDoc(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, doc)
 }
 
+// listRepoSecrets liste les secrets du dépôt rattaché.
+//
+// Seuls les noms remontent : GitHub ne restitue jamais les valeurs. C'est
+// suffisant pour savoir ce que le CI connaît, et lever le doute quand on
+// cherche dans Kybers un secret qui n'y est pas.
+func (a *API) listRepoSecrets(w http.ResponseWriter, r *http.Request) {
+	full, err := a.repoOf(r)
+	if err != nil {
+		// Sans dépôt rattaché, il n'y a pas de secrets à lister — ce n'est pas
+		// une erreur, l'onglet affiche simplement une liste vide.
+		writeJSON(w, http.StatusOK, []gitapi.Secret{})
+		return
+	}
+	env := strings.TrimSpace(r.URL.Query().Get("env"))
+	var secrets []gitapi.Secret
+	if env != "" {
+		secrets, err = a.git.ListEnvSecrets(r.Context(), full, env)
+	} else {
+		secrets, err = a.git.ListSecrets(r.Context(), full)
+	}
+	if err != nil {
+		a.log.Warn("secrets du dépôt indisponibles", "repo", full, "err", err)
+		writeJSON(w, http.StatusOK, []gitapi.Secret{})
+		return
+	}
+	writeJSON(w, http.StatusOK, secrets)
+}
+
+// putRepoSecrets dépose des secrets sur le dépôt rattaché.
+//
+// Ils ne transitent pas par la base : GitHub ne restituant jamais une valeur,
+// en garder une copie créerait un second exemplaire à protéger sans rien
+// apporter. Kybers écrit, puis ne connaît plus que les noms.
+func (a *API) putRepoSecrets(w http.ResponseWriter, r *http.Request) {
+	full, err := a.repoOf(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "aucun dépôt rattaché à cette application")
+		return
+	}
+
+	var req struct {
+		Secrets []models.EnvVar `json:"secrets"`
+	}
+	if err := decode(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "corps illisible")
+		return
+	}
+
+	// Un environnement cloisonne : GitHub ne livre ces secrets qu'aux workflows
+	// qui le visent. Sans environnement, ils restent communs au dépôt.
+	env := strings.TrimSpace(r.URL.Query().Get("env"))
+
+	written := []string{}
+	for _, s := range req.Secrets {
+		name := strings.TrimSpace(s.Key)
+		if name == "" {
+			continue
+		}
+		var err error
+		if env != "" {
+			err = a.git.PutEnvSecret(r.Context(), full, env, name, s.Value)
+		} else {
+			err = a.git.PutSecret(r.Context(), full, name, s.Value)
+		}
+		if err != nil {
+			a.log.Warn("secret refusé", "repo", full, "nom", name, "err", err)
+			// Les précédents sont écrits : le dire évite de tout ressaisir.
+			writeErr(w, http.StatusBadGateway, fmt.Sprintf(
+				"%s refusé : %v. %d secret(s) déjà écrit(s).", name, err, len(written)))
+			return
+		}
+		written = append(written, name)
+	}
+
+	a.log.Info("secrets déposés", "repo", full, "nombre", len(written))
+	writeJSON(w, http.StatusOK, map[string]any{"repo": full, "written": written})
+}
+
+// listRepoVars liste les variables Actions du dépôt, valeurs comprises.
+//
+// Contrairement aux secrets, GitHub les restitue : elles sont faites pour être
+// relues, et s'affichent donc telles quelles.
+func (a *API) listRepoVars(w http.ResponseWriter, r *http.Request) {
+	full, err := a.repoOf(r)
+	if err != nil {
+		writeJSON(w, http.StatusOK, []gitapi.Variable{})
+		return
+	}
+	env := strings.TrimSpace(r.URL.Query().Get("env"))
+	var vars []gitapi.Variable
+	if env != "" {
+		vars, err = a.git.ListEnvVariables(r.Context(), full, env)
+	} else {
+		vars, err = a.git.ListVariables(r.Context(), full)
+	}
+	if err != nil {
+		a.log.Warn("variables du dépôt indisponibles", "repo", full, "err", err)
+		writeJSON(w, http.StatusOK, []gitapi.Variable{})
+		return
+	}
+	writeJSON(w, http.StatusOK, vars)
+}
+
+// putRepoVars dépose des variables sur le dépôt rattaché.
+func (a *API) putRepoVars(w http.ResponseWriter, r *http.Request) {
+	full, err := a.repoOf(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "aucun dépôt rattaché à cette application")
+		return
+	}
+
+	var req struct {
+		Variables []models.EnvVar `json:"variables"`
+	}
+	if err := decode(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "corps illisible")
+		return
+	}
+
+	env := strings.TrimSpace(r.URL.Query().Get("env"))
+
+	written := []string{}
+	for _, v := range req.Variables {
+		name := strings.TrimSpace(v.Key)
+		if name == "" {
+			continue
+		}
+		var err error
+		if env != "" {
+			err = a.git.PutEnvVariable(r.Context(), full, env, name, v.Value)
+		} else {
+			err = a.git.PutVariable(r.Context(), full, name, v.Value)
+		}
+		if err != nil {
+			a.log.Warn("variable refusée", "repo", full, "nom", name, "err", err)
+			writeErr(w, http.StatusBadGateway, fmt.Sprintf(
+				"%s refusée : %v. %d variable(s) déjà écrite(s).", name, err, len(written)))
+			return
+		}
+		written = append(written, name)
+	}
+
+	a.log.Info("variables déposées", "repo", full, "nombre", len(written))
+	writeJSON(w, http.StatusOK, map[string]any{"repo": full, "written": written})
+}
+
+// deleteRepoVar retire une variable du dépôt.
+func (a *API) deleteRepoVar(w http.ResponseWriter, r *http.Request) {
+	full, err := a.repoOf(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "aucun dépôt rattaché")
+		return
+	}
+	env := strings.TrimSpace(r.URL.Query().Get("env"))
+	name := r.PathValue("name")
+	if env != "" {
+		err = a.git.DeleteEnvVariable(r.Context(), full, env, name)
+	} else {
+		err = a.git.DeleteVariable(r.Context(), full, name)
+	}
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// deleteRepoSecret retire un secret du dépôt.
+func (a *API) deleteRepoSecret(w http.ResponseWriter, r *http.Request) {
+	full, err := a.repoOf(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "aucun dépôt rattaché")
+		return
+	}
+	env := strings.TrimSpace(r.URL.Query().Get("env"))
+	name := r.PathValue("name")
+	if env != "" {
+		err = a.git.DeleteEnvSecret(r.Context(), full, env, name)
+	} else {
+		err = a.git.DeleteSecret(r.Context(), full, name)
+	}
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// listRepoEnvs retourne les environnements déclarés sur le dépôt.
+//
+// Ce sont eux qui cloisonnent les secrets : GitHub ne livre à un workflow que
+// ceux de l'environnement qu'il vise.
+func (a *API) listRepoEnvs(w http.ResponseWriter, r *http.Request) {
+	full, err := a.repoOf(r)
+	if err != nil {
+		writeJSON(w, http.StatusOK, []string{})
+		return
+	}
+	envs, err := a.git.ListEnvironments(r.Context(), full)
+	if err != nil {
+		a.log.Warn("environnements du dépôt indisponibles", "repo", full, "err", err)
+		writeJSON(w, http.StatusOK, []string{})
+		return
+	}
+	writeJSON(w, http.StatusOK, envs)
+}
+
+// createRepoEnv déclare un environnement sur le dépôt.
+//
+// Il naissait jusqu'ici du premier secret déposé : le créer d'abord permet de
+// préparer le cloisonnement avant d'avoir une valeur à y mettre.
+func (a *API) createRepoEnv(w http.ResponseWriter, r *http.Request) {
+	full, err := a.repoOf(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "aucun dépôt rattaché à cette application")
+		return
+	}
+
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeErr(w, http.StatusBadRequest, "nom d'environnement requis")
+		return
+	}
+
+	if err := a.git.EnsureEnvironment(r.Context(), full, name); err != nil {
+		a.log.Warn("création d'environnement refusée", "repo", full, "nom", name, "err", err)
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{"name": name})
+}
+
+// deleteRepoEnv supprime un environnement du dépôt, avec son contenu.
+func (a *API) deleteRepoEnv(w http.ResponseWriter, r *http.Request) {
+	full, err := a.repoOf(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "aucun dépôt rattaché")
+		return
+	}
+	if err := a.git.DeleteEnvironment(r.Context(), full, r.PathValue("name")); err != nil {
+		a.log.Warn("suppression d'environnement refusée", "repo", full, "err", err)
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (a *API) listAppRuns(w http.ResponseWriter, r *http.Request) {
 	full, err := a.repoOf(r)
 	if err != nil {
@@ -1465,7 +1725,7 @@ func (a *API) deleteApp(w http.ResponseWriter, r *http.Request) {
 	// rappellera pour finaliser une fois les environnements retirés.
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"pending_environments": len(live),
-		"message": "suppression des environnements en cours ; l'application sera retirée une fois le cluster nettoyé",
+		"message":              "suppression des environnements en cours ; l'application sera retirée une fois le cluster nettoyé",
 	})
 }
 
@@ -1757,6 +2017,9 @@ func (a *API) listTemplates(w http.ResponseWriter, r *http.Request) {
 
 	// Les modèles fournis sont insérés à la première consultation : l'équipe
 	// les retrouve dans sa bibliothèque, modifiables comme les siens.
+	if err := a.db.SeedGoldenPaths(r.Context(), orgID); err != nil {
+		a.log.Error("SeedGoldenPaths", "err", err)
+	}
 	if err := a.db.SeedTemplates(r.Context(), orgID); err != nil {
 		a.log.Error("SeedTemplates", "err", err)
 	}
@@ -1828,6 +2091,8 @@ func (a *API) gitWriteFiles(w http.ResponseWriter, r *http.Request) {
 			Content string `json:"content"`
 		} `json:"files"`
 		TokenName string `json:"token_name"`
+		/** Secrets chiffrés déposés sur le dépôt, lisibles par le CI seul. */
+		Secrets []models.EnvVar `json:"secrets"`
 	}
 	if err := decode(r, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "JSON invalide")
@@ -1870,34 +2135,184 @@ func (a *API) gitWriteFiles(w http.ResponseWriter, r *http.Request) {
 
 	// Chaque fichier est tenté ; un échec n'annule pas les précédents, mais il
 	// est remonté pour que l'appelant sache quoi reprendre.
+	// Un seul commit pour tout : l'API Contents en produisait un par fichier,
+	// noyant l'historique sous des états intermédiaires que personne n'a eus.
+	files := make([]gitapi.File, 0, len(req.Files))
 	written := []string{}
-	failures := map[string]string{}
 	for _, f := range req.Files {
 		path := strings.TrimSpace(f.Path)
 		if path == "" {
 			continue
 		}
-		if err := a.git.PutFile(r.Context(), full, path, f.Content,
-			"chore: initialisation depuis Kybers"); err != nil {
-			failures[path] = err.Error()
-			continue
-		}
+		files = append(files, gitapi.File{Path: path, Content: f.Content})
 		written = append(written, path)
 	}
 
+	failures := map[string]string{}
+	message := fmt.Sprintf("chore: initialisation depuis Kybers (%d fichiers)", len(files))
+	if len(files) == 1 {
+		message = "chore: " + files[0].Path + " depuis Kybers"
+	}
+
+	if err := a.git.PutFiles(r.Context(), full, files, message); err != nil {
+		// L'écriture est atomique : un échec ne laisse rien derrière, il n'y a
+		// donc pas de fichier à reprendre un par un.
+		a.log.Warn("écriture des fichiers refusée", "repo", full, "err", err)
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	// Les secrets suivent les fichiers : le workflow qu'on vient d'écrire les
+	// attend souvent dès sa première exécution.
+	secrets := []string{}
+	for _, sec := range req.Secrets {
+		name := strings.TrimSpace(sec.Key)
+		if name == "" {
+			continue
+		}
+		if err := a.git.PutSecret(r.Context(), full, name, sec.Value); err != nil {
+			// Les fichiers sont écrits : refuser ici laisserait croire que
+			// rien n'a abouti. Le secret manquant est nommé, il se reprend
+			// depuis les paramètres du dépôt.
+			a.log.Warn("secret refusé", "repo", full, "nom", name, "err", err)
+			writeErr(w, http.StatusBadGateway,
+				fmt.Sprintf("Fichiers écrits, mais le secret %s a été refusé : %v", name, err))
+			return
+		}
+		secrets = append(secrets, name)
+	}
+
 	a.log.Info("fichiers écrits", "repo", full,
-		"écrits", len(written), "échecs", len(failures))
+		"écrits", len(written), "secrets", len(secrets))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"repo":     full,
 		"written":  written,
 		"failures": failures,
 		"secret":   needsToken,
+		"secrets":  secrets,
 	})
 }
 
 // ---------------------------------------------------------------------------
 // Dossiers de modèles
 // ---------------------------------------------------------------------------
+
+// listRuntimeVersions liste les versions disponibles pour un type.
+//
+// Elles viennent des tags réellement publiés par l'image de base, filtrés des
+// variantes d'OS et des alias. Le registre pouvant être injoignable — instance
+// hors ligne, quota atteint — la liste figée du dossier sert de repli : mieux
+// vaut trois versions un peu datées qu'un sélecteur vide.
+func (a *API) listRuntimeVersions(w http.ResponseWriter, r *http.Request) {
+	orgID, _ := currentOrg(r)
+
+	folders, err := a.db.ListFolders(r.Context(), orgID)
+	if err != nil {
+		a.fail(w, "ListFolders", err)
+		return
+	}
+
+	id := r.PathValue("id")
+	var folder *models.TemplateFolder
+	for i := range folders {
+		if folders[i].ID == id {
+			folder = &folders[i]
+			break
+		}
+	}
+	if folder == nil {
+		writeErr(w, http.StatusNotFound, "type inconnu")
+		return
+	}
+
+	// `versions` restreint ce que le registre publie aux branches validées par
+	// l'organisation : c'est un filtre, pas une liste de substitution. Une
+	// liste figée vieillissait sans que personne ne la mette à jour.
+	allow := []string{}
+	for _, v := range strings.Split(folder.Versions, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			allow = append(allow, v)
+		}
+	}
+
+	fallback := func(reason string) {
+		out := []registryapi.Version{}
+		for _, v := range allow {
+			out = append(out, registryapi.Version{Name: v})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"versions": out,
+			"source":   reason,
+		})
+	}
+
+	if folder.RuntimeImage == "" {
+		fallback("liste figée")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+
+	tags, err := a.hub.ListTags(ctx, folder.RuntimeImage, "")
+	if err != nil {
+		a.log.Warn("versions du runtime indisponibles",
+			"image", folder.RuntimeImage, "err", err)
+		fallback("registre injoignable")
+		return
+	}
+
+	// Les runtimes anciens ne sont plus maintenus : les proposer inviterait à
+	// démarrer un service sur une base sans correctifs de sécurité.
+	versions := registryapi.FilterVersions(tags, minSupportedMajor(folder.RuntimeImage))
+
+	// `?all=1` sert au réglage du filtre lui-même : appliquer la restriction
+	// masquerait les branches qu'on veut justement pouvoir ajouter.
+	if r.URL.Query().Get("all") != "1" {
+		versions = registryapi.KeepAllowed(versions, allow)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"versions": versions,
+		"source":   folder.RuntimeImage,
+	})
+}
+
+// minSupportedMajor écarte les versions hors support de chaque écosystème.
+func minSupportedMajor(image string) int {
+	switch image {
+	case "node":
+		return 20
+	case "python":
+		return 3
+	case "golang":
+		return 1
+	}
+	return 0
+}
+
+// listBuiltinGoldenPaths expose les types fournis avec Kybers.
+//
+// Ils ne sont pas encore installés : le dashboard les propose à côté de ceux
+// de l'organisation, pour qu'un type supprimé ou jamais reçu reste accessible.
+func (a *API) listBuiltinGoldenPaths(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, db.ListBuiltinGoldenPaths())
+}
+
+// installGoldenPath copie un type fourni dans l'organisation.
+func (a *API) installGoldenPath(w http.ResponseWriter, r *http.Request) {
+	orgID, _ := currentOrg(r)
+	saved, err := a.db.InstallGoldenPath(r.Context(), orgID, r.PathValue("key"))
+	if errors.Is(err, db.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "type inconnu")
+		return
+	}
+	if err != nil {
+		a.fail(w, "InstallGoldenPath", err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, saved)
+}
 
 func (a *API) listFolders(w http.ResponseWriter, r *http.Request) {
 	orgID, _ := currentOrg(r)
@@ -1945,7 +2360,10 @@ func (a *API) deleteFolder(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusNotFound, "dossier introuvable")
 			return
 		}
-		a.fail(w, "DeleteFolder", err)
+		// « erreur interne » n'aide personne à comprendre un refus de
+		// contrainte : la cause est journalisée et remontée telle quelle.
+		a.log.Error("DeleteFolder", "err", err)
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

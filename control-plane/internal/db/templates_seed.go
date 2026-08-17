@@ -129,10 +129,13 @@ func (d *DB) SeedTemplates(ctx context.Context, orgID string) error {
 	}
 
 	for _, t := range builtinTemplates {
+		// L'unicité porte sur le chemin depuis la migration 013 : viser
+		// l'ancienne contrainte de nom échouait sur une instance neuve.
 		if _, err := d.Pool.Exec(ctx, `
 			INSERT INTO file_templates (org_id, name, description, kind, path, content, is_default)
 			VALUES ($1, $2, $3, $4, $5, $6, $7)
-			ON CONFLICT (org_id, name) DO NOTHING`,
+			ON CONFLICT (org_id, COALESCE(folder_id, '00000000-0000-0000-0000-000000000000'::uuid), path)
+			DO NOTHING`,
 			orgID, t.Name, t.Description, t.Kind, t.Path, t.Content, t.IsDefault,
 		); err != nil {
 			return err

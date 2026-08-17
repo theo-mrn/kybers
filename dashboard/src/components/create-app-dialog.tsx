@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { useActionState, useState } from "react";
+import { useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   ArrowLeft,
@@ -12,19 +12,27 @@ import {
   Loader2,
   Plus,
   FileCode,
-  Eye,
+  Variable,
+  Boxes,
   Tag,
   XCircle,
 } from "lucide-react";
 
-import { createAppAction, type ActionState } from "@/app/actions";
-import type { FileTemplate, TemplateFolder, GitStatus } from "@/lib/api";
+import { createAppBundleAction, type ActionState } from "@/app/actions";
+import type {
+  BuiltinGoldenPath,
+  FileTemplate,
+  TemplateFolder,
+  GitStatus,
+} from "@/lib/api";
 import { GitStep } from "@/components/git-step";
-import { FilesStep, buildFiles } from "@/components/files-step";
+import { buildFiles, render } from "@/components/files-step";
+import { FilePicker } from "@/components/file-picker";
 import { FilePreview } from "@/components/file-preview";
+import type { CustomFile } from "@/components/custom-file-dialog";
+import { EnvStep, splitEnv, type EnvEntry } from "@/components/env-step";
+import { GoldenPathStep, presetOf } from "@/components/golden-path-step";
 import { findCollisions } from "@/lib/repo-path";
-import { writeRepoFilesAction } from "@/app/actions";
-import { SubmitButton } from "@/components/forms";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -40,10 +48,11 @@ import {
 import { cn } from "@/lib/utils";
 
 const STEPS = [
+  { key: "type", label: "Type", icon: Boxes },
   { key: "identite", label: "Identité", icon: Tag },
   { key: "depot", label: "Dépôt Git", icon: GitBranch },
+  { key: "config", label: "Configuration", icon: Variable },
   { key: "fichiers", label: "Fichiers", icon: FileCode },
-  { key: "apercu", label: "Aperçu", icon: Eye },
 ] as const;
 
 /** Nom Kubernetes valide : il devient le préfixe des namespaces. */
@@ -91,6 +100,7 @@ export function CreateAppDialog({
   baseUrl,
   templates = [],
   folders = [],
+  builtinPaths = [],
 }: {
   /** État de l'intégration : conditionne ce que l'étape « dépôt » propose. */
   gitStatus: GitStatus;
@@ -99,49 +109,91 @@ export function CreateAppDialog({
   /** Modèles de l'organisation, proposés avant ceux de Kybers. */
   templates?: FileTemplate[];
   folders?: TemplateFolder[];
+  /** Types fournis avec Kybers, installables depuis le parcours. */
+  builtinPaths?: BuiltinGoldenPath[];
 }) {
   const [open, setOpen] = useState(false);
-  const [rawStep, setStep] = useState(0);
+  const [step, setStep] = useState(0);
   const [name, setName] = useState("");
-  const router = useRouter();
-
-  const [state, action] = useActionState<ActionState, FormData>(
-    createAppAction,
-    null,
-  );
-
-  // L'application est créée à l'étape 2. Son identifiant figure dans l'URL
-  // qu'appellera le workflow : l'étape « pipeline » ne peut donc s'afficher
-  // qu'ensuite, avec cet identifiant en main.
-  const createdId = state?.ok ? state.id : undefined;
   const [repo, setRepo] = React.useState("");
+  const [createRepo, setCreateRepo] = React.useState<{
+    owner: string;
+    name: string;
+    private: boolean;
+  } | null>(null);
   const [running, setRunning] = React.useState(false);
-  const [filesState, setFilesState] = React.useState<ActionState>(null);
+  // Vérification du dépôt, déclenchée par « Continuer » : l'étape n'a pas de
+  // bouton propre, résoudre le dépôt fait partie du fait de la quitter.
+  const probeGit = React.useRef<(() => Promise<boolean>) | null>(null);
+  const [checking, setChecking] = React.useState(false);
+  // Stable : une lambda inline relancerait l'effet de GitStep à chaque rendu.
+  const registerProbe = React.useCallback((fn: () => Promise<boolean>) => {
+    probeGit.current = fn;
+  }, []);
+  const [state, setState] = React.useState<ActionState>(null);
+  const router = useRouter();
 
   // Les modèles marqués par défaut sont cochés d'emblée : c'est la convention
   // de l'équipe, on la suit sauf décision contraire.
-  const [files, setFiles] = React.useState<string[]>(() =>
-    templates.filter((t) => t.is_default).map((t) => t.id),
+  // Vide au départ : c'est le type choisi qui garnit la sélection.
+  const [files, setFiles] = React.useState<string[]>([]);
+  // Fichiers saisis pour cette application seulement : ils ne rejoignent pas
+  // la bibliothèque de modèles.
+  const [custom, setCustom] = React.useState<CustomFile[]>([]);
+  const [pathId, setPathId] = React.useState<string | null>(null);
+  const [env, setEnv] = React.useState<EnvEntry[]>([]);
+  const [version, setVersion] = React.useState("");
+
+  // Les dossiers marqués comme types : les autres restent de simples
+  // regroupements, sans vocation à ouvrir un parcours.
+  const goldenPaths = React.useMemo(
+    () => folders.filter((f) => f.is_golden_path),
+    [folders],
   );
 
-
-  // L'application créée, seule l'étape « pipeline » a du sens : la déduire
-  // évite un rendu en cascade.
-  const step = createdId && rawStep < 2 ? 2 : rawStep;
+  /**
+   * Retient un type et coche ses fichiers.
+   *
+   * La sélection précédente est remplacée, pas complétée : changer d'avis sur
+   * le type ne doit pas laisser traîner le Dockerfile du précédent.
+   */
+  function pickPath(id: string | null) {
+    setPathId(id);
+    // Le sélecteur retient la première version proposée dès qu'il a répondu :
+    // la version par défaut n'est plus saisie à la main, elle se déduit de ce
+    // que le registre publie sous les branches autorisées.
+    setVersion(folders.find((f) => f.id === id)?.default_version ?? "");
+    setFiles(
+      id ? templates.filter((t) => t.folder_id === id).map((t) => t.id) : [],
+    );
+  }
 
   const slug = sanitizeName(name);
 
-  // Ce que l'aperçu montre est exactement ce qui sera écrit : même appel,
-  // mêmes substitutions. Les faire diverger tromperait sur le résultat.
+  // `{{endpoint}}` reste tel quel : il porte l'identifiant de l'application,
+  // qui n'existera qu'au moment de l'écriture. Le serveur le substituera.
   const payload = React.useMemo(
     () =>
       buildFiles(templates, files, {
         app: slug,
         repo,
         env: "production",
-        endpoint: `${baseUrl}/api/v1/apps/${createdId ?? ""}/deploy`,
-      }),
-    [templates, files, slug, repo, baseUrl, createdId],
+        endpoint: "{{endpoint}}",
+        version,
+      }, custom),
+    [templates, files, slug, repo, custom, version],
+  );
+
+  const vars = React.useMemo(
+    () => ({
+      app: slug,
+      repo,
+      env: "production",
+      // Substitué côté serveur : l'identifiant n'existe pas encore.
+      endpoint: "{{endpoint}}",
+      version,
+    }),
+    [slug, repo, version],
   );
 
   // Deux fichiers visant le même chemin ne produiraient qu'un seul fichier :
@@ -151,40 +203,70 @@ export function CreateAppDialog({
     [payload.files],
   );
 
+  const preset = React.useMemo(
+    () => presetOf(goldenPaths, pathId),
+    [goldenPaths, pathId],
+  );
+
+  /**
+   * Joue tout le parcours en une fois.
+   *
+   * Dépôt, application et fichiers naissent ensemble : abandonner avant cette
+   * validation ne laisse rien derrière soi.
+   */
   async function finish() {
-    // Rien de coché : on ferme sans appeler l'API.
-    if (createdId && repo && files.length > 0) {
-      const data = new FormData();
-      data.set("repo", repo);
-      data.set("files", JSON.stringify(payload.files));
-      data.set("needs_token", String(payload.needsToken));
-      data.set("app_name", slug);
+    setRunning(true);
+    setState(null);
+    try {
+      const res = await createAppBundleAction({
+        name: slug,
+        // Le type sait quel port son écosystème écoute — 3000 pour Node,
+        // 8000 pour Python. Sans type, une valeur par défaut ajustable.
+        containerPort: preset?.containerPort || 8080,
+        extraPorts: [],
+        repo,
+        createRepo: createRepo
+          ? { ...createRepo, description: "" }
+          : undefined,
+        files: payload.files,
+        needsToken: payload.needsToken,
+        baseUrl,
+        envVars: splitEnv(env).vars,
+        secrets: splitEnv(env).secrets,
+      });
 
-      setRunning(true);
-      try {
-        const res = await writeRepoFilesAction(null, data);
-        setFilesState(res);
-        // Un échec laisse sur place : les fichiers écrits le restent, et le
-        // message dit lesquels reprendre.
-        if (!res?.ok) return;
-      } finally {
-        setRunning(false);
-      }
+      setState(res);
+      if (!res?.ok) return;
+
+      setOpen(false);
+      setStep(0);
+      if (res.id) router.push(`/apps/${res.id}`);
+      else router.refresh();
+    } finally {
+      setRunning(false);
     }
-
-    setOpen(false);
-    setStep(0);
-    // La navigation rafraîchit la liste : l'action de création s'en abstient
-    // pour ne pas détruire le parcours en cours.
-    if (createdId) router.push(`/apps/${createdId}`);
-    else router.refresh();
   }
 
-  const canNext = step === 0 ? slug.length > 0 : true;
+  // Une version doit être retenue avant de quitter l'étape du type : sans
+  // elle, les fichiers partiraient avec un `{{version}}` non substitué.
+  const canNext =
+    step === 0
+      ? pathId === null || version !== ""
+      : step === 1
+        ? slug.length > 0
+        : true;
 
+  /** Referme et remet le parcours à zéro : rien n'a été écrit. */
   function close() {
     setOpen(false);
     setStep(0);
+    setState(null);
+    // Le parcours abandonné ne doit rien laisser au suivant.
+    setCustom([]);
+    setPathId(null);
+    setVersion("");
+    setEnv([]);
+    setFiles([]);
   }
 
   return (
@@ -200,9 +282,11 @@ export function CreateAppDialog({
             "flex flex-col",
             // L'aperçu affiche deux panneaux : il lui faut de la largeur et une
             // hauteur bornée, sinon l'arborescence et le code s'effondrent.
-            step === 3
+            // L'aperçu affiche deux panneaux, le choix du type une grille de
+            // cartes : les deux étouffaient dans une modale étroite.
+            step === 4
               ? "h-[88vh] max-h-[88vh] sm:max-w-5xl"
-              : "max-h-[85vh] sm:max-w-2xl",
+              : "h-[85vh] max-h-[85vh] sm:max-w-3xl",
           )}
         >
           <DialogHeader>
@@ -249,13 +333,25 @@ export function CreateAppDialog({
 
           <Separator />
 
-          <form
-            action={action}
-            className="flex min-h-0 flex-1 flex-col gap-4"
-          >
+          <div className="flex min-h-0 flex-1 flex-col gap-4">
             <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto pr-1">
-            {/* --- 1. Identité ------------------------------------------- */}
+            {/* --- 0. Type ----------------------------------------------- */}
             <div className={cn("flex flex-col gap-4", step !== 0 && "hidden")}>
+              <GoldenPathStep
+                paths={goldenPaths}
+                builtin={builtinPaths}
+                selected={pathId}
+                onChange={pickPath}
+                version={version}
+                onVersionChange={setVersion}
+                // La liste vient du serveur : sans rechargement, le type
+                // installé n'apparaîtrait qu'à la prochaine visite.
+                onInstalled={() => router.refresh()}
+              />
+            </div>
+
+            {/* --- 1. Identité ------------------------------------------- */}
+            <div className={cn("flex flex-col gap-4", step !== 1 && "hidden")}>
               <Field
                 label="Nom de l'application"
                 htmlFor="app_name"
@@ -292,15 +388,17 @@ export function CreateAppDialog({
             </div>
 
             {/* --- 2. Dépôt ---------------------------------------------- */}
-            <div className={cn("flex flex-col gap-4", step !== 1 && "hidden")}>
-              <GitStep status={gitStatus} appName={slug} onResolved={setRepo} />
+            <div className={cn("flex flex-col gap-4", step !== 2 && "hidden")}>
+              <GitStep
+                status={gitStatus}
+                appName={slug}
+                onResolved={setRepo}
+                onCreateRequest={setCreateRepo}
+                onReady={registerProbe}
+              />
             </div>
 
-            {/* Le port réel dépend de l'image, encore inconnue à ce stade :
-                une valeur par défaut suffit, ajustable ensuite. */}
-            <input type="hidden" name="container_port" value="8080" />
-
-            {step === 1 && (
+            {step === 2 && (
               <p className="flex items-start gap-2 rounded-md bg-muted/60 px-3 py-2 text-xs text-muted-foreground">
                 <Info className="mt-0.5 size-3.5 shrink-0" />
                 <span>
@@ -311,63 +409,48 @@ export function CreateAppDialog({
             )}
 
             {/* --- 3. Fichiers ------------------------------------------- */}
-            <div className={cn("flex flex-col gap-4", step !== 2 && "hidden")}>
-              {createdId ? (
-                <>
-                  <p className="flex items-center gap-2 rounded-md border border-success/30 bg-success/5 px-3 py-2 text-xs text-success">
-                    <Check className="size-3.5 shrink-0" />
-                    Application <strong className="font-medium">{slug}</strong>{" "}
-                    créée.
-                  </p>
-
-                  <FilesStep
-                    repo={repo}
-                    appId={createdId}
-                    appName={slug}
-                    baseUrl={baseUrl}
-                    templates={templates}
-                    folders={folders}
-                    selected={files}
-                    onChange={setFiles}
-                  />
-
-                  {filesState && !filesState.ok && (
-                    <p
-                      className="flex items-start gap-1.5 text-xs text-destructive"
-                      role="alert"
-                    >
-                      <XCircle className="mt-0.5 size-3.5 shrink-0" />
-                      {filesState.message}
-                    </p>
-                  )}
-                </>
-              ) : (
-                <p className="text-xs text-muted-foreground">
-                  L&apos;application sera créée à l&apos;étape précédente.
-                </p>
-              )}
+            {/* --- 3. Configuration -------------------------------------- */}
+            <div className={cn("flex flex-col gap-4", step !== 3 && "hidden")}>
+              <EnvStep entries={env} onChange={setEnv} repo={repo} />
             </div>
 
-            {/* --- 4. Aperçu --------------------------------------------- */}
+            {/* --- 4. Fichiers et aperçu --------------------------------- */}
             <div
               className={cn(
                 "flex min-h-0 flex-1 flex-col gap-3",
-                step !== 3 && "hidden",
+                step !== 4 && "hidden",
               )}
             >
-              <p className="shrink-0 text-xs text-muted-foreground">
-                Ce que Kybers écrira dans{" "}
-                <span className="font-mono text-foreground">{repo}</span>,
-                substitutions appliquées.
-              </p>
+              {/* Les fichiers du type sont là d'emblée : on les lit, et on en
+                  ajoute au même endroit plutôt que dans une étape séparée. */}
+              <div className="flex shrink-0 flex-wrap items-center justify-between gap-2">
+                <p className="text-xs text-muted-foreground">
+                  Écrits dans{" "}
+                  <span className="font-mono text-foreground">
+                    {repo || "le dépôt"}
+                  </span>{" "}
+                  à la validation.
+                </p>
 
-              <FilePreview files={payload.files} className="min-h-96 flex-1" />
+                <FilePicker
+                  templates={templates}
+                  folders={folders}
+                  selected={files}
+                  onChange={setFiles}
+                  renderPath={(pt) => render(pt, vars)}
+                  renderContent={(c) => render(c, vars)}
+                  custom={custom}
+                  onCustomChange={setCustom}
+                  compact
+                />
+              </div>
+
+              <FilePreview files={payload.files} className="min-h-0 flex-1" />
 
               {payload.needsToken && (
                 <p className="flex shrink-0 items-start gap-2 rounded-md border border-border bg-muted/60 px-3 py-2 text-xs text-muted-foreground">
                   <Info className="mt-0.5 size-3.5 shrink-0" />
-                  Un workflow est inclus : un jeton de déploiement sera créé et
-                  ajouté aux secrets du dépôt. Votre jeton GitHub doit porter le
+                  Un workflow est inclus : votre jeton GitHub doit porter le
                   scope <code className="font-mono">workflow</code>.
                 </p>
               )}
@@ -386,36 +469,49 @@ export function CreateAppDialog({
             </div>
 
             <DialogFooter className="shrink-0 border-t border-border pt-4">
-              {/* Une fois l'application créée, revenir en arrière n'a plus de
-                  sens : elle existe. */}
-              {/* Revenir sur l'identité ou le dépôt n'a plus de sens une fois
-                  l'application créée, mais revoir sa sélection de fichiers, si. */}
-              {(step > 0 && !createdId) || step === 3 ? (
+              {/* Rien n'est écrit avant la validation finale : revenir en
+                  arrière est sans conséquence à toutes les étapes. */}
+              {step > 0 ? (
                 <Button
                   type="button"
                   variant="outline"
+                  disabled={running}
                   onClick={() => setStep((s) => s - 1)}
                 >
                   <ArrowLeft className="size-3.5" />
                   Retour
                 </Button>
               ) : (
-                !createdId && (
-                  <Button type="button" variant="outline" onClick={close}>
-                    Annuler
-                  </Button>
-                )
+                <Button type="button" variant="outline" onClick={close}>
+                  Annuler
+                </Button>
               )}
 
-              {/* Le bouton final écrit les fichiers cochés : aucune action
-                  intermédiaire à déclencher soi-même. */}
-              {createdId && step === 2 && files.length > 0 ? (
-                // Rien n'est écrit avant l'aperçu : on valide ce qu'on a vu.
-                <Button type="button" onClick={() => setStep(3)}>
-                  Voir l&apos;aperçu
-                  <ArrowRight className="size-3.5" />
+              {step < STEPS.length - 1 ? (
+                <Button
+                  type="button"
+                  disabled={!canNext || checking}
+                  onClick={async () => {
+                    // L'étape « dépôt » ne se quitte qu'une fois la référence
+                    // résolue : un dépôt introuvable laisse sur place, avec le
+                    // message d'erreur affiché par l'étape.
+                    if (step === 2 && probeGit.current) {
+                      setChecking(true);
+                      const ok = await probeGit.current().finally(() =>
+                        setChecking(false),
+                      );
+                      if (!ok) return;
+                    }
+                    setStep((s) => s + 1);
+                  }}
+                >
+                  {checking ? (
+                    <Loader2 className="size-3.5 animate-spin" />
+                  ) : null}
+                  {checking ? "Vérification…" : "Continuer"}
+                  {!checking && <ArrowRight className="size-3.5" />}
                 </Button>
-              ) : createdId ? (
+              ) : (
                 <Button
                   type="button"
                   disabled={running || collisions.length > 0}
@@ -428,30 +524,14 @@ export function CreateAppDialog({
                 >
                   {running ? (
                     <Loader2 className="size-3.5 animate-spin" />
-                  ) : null}
-                  {files.length > 0
-                    ? `Créer ${files.length} fichier${files.length > 1 ? "s" : ""}`
-                    : "Terminer"}
-                  <ArrowRight className="size-3.5" />
+                  ) : (
+                    <Check className="size-3.5" />
+                  )}
+                  {running ? "Création…" : "Créer l'application"}
                 </Button>
-              ) : step === 0 ? (
-                <Button
-                  type="button"
-                  disabled={!canNext}
-                  onClick={() => setStep(1)}
-                >
-                  Continuer
-                  <ArrowRight className="size-3.5" />
-                </Button>
-              ) : (
-                <SubmitButton
-                  label="Créer et continuer"
-                  pendingLabel="Création…"
-                  icon={ArrowRight}
-                />
               )}
             </DialogFooter>
-          </form>
+          </div>
         </DialogContent>
       </Dialog>
     </>
