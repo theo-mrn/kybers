@@ -120,19 +120,44 @@ type Provenance struct {
 // Les placeholders {{app}}, {{repo}}, {{env}} et {{endpoint}} sont substitués
 // à l'écriture : un même modèle sert ainsi toutes les applications.
 type TemplateFolder struct {
-	ID          string    `json:"id"`
-	OrgID       string    `json:"org_id"`
-	Name        string    `json:"name"`
-	Description string    `json:"description"`
+	ID          string `json:"id"`
+	OrgID       string `json:"org_id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
 	/** Nombre de modèles qu'il contient, pour l'affichage. */
-	FileCount int       `json:"file_count"`
+	FileCount int `json:"file_count"`
+
+	// Golden path : le dossier devient un type d'application proposé à la
+	// création. Ses réglages sont recopiés dans l'application, qui les possède
+	// ensuite — les modifier ici ne retouche rien d'existant.
+	IsGoldenPath bool   `json:"is_golden_path"`
+	Icon         string `json:"icon"`
+	/** Image dont les tags font les versions : "node", "python", "golang". */
+	RuntimeImage string `json:"runtime_image"`
+	/** Versions de repli, si l'image est absente ou le registre injoignable. */
+	Versions string `json:"versions"`
+	/** Version retenue par défaut, parmi celles proposées. */
+	DefaultVersion string `json:"default_version"`
+	/** Port écouté par l'exécution ; 0 = défaut de l'instance. */
+	DefaultPort   int    `json:"default_port"`
+	CPURequest    string `json:"cpu_request"`
+	MemoryRequest string `json:"memory_request"`
+	CPULimit      string `json:"cpu_limit"`
+	MemoryLimit   string `json:"memory_limit"`
+	/** Chemin de la sonde HTTP ; vide = pas de sonde préconfigurée. */
+	ProbePath string `json:"probe_path"`
+	/** Délai avant la première sonde, en secondes. */
+	ProbeInitialDelay int `json:"probe_initial_delay"`
+	/** UID non-root imposé par l'image de base ; 0 = non contraint. */
+	RunAsUser int `json:"run_as_user"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type FileTemplate struct {
-	ID          string `json:"id"`
-	OrgID       string `json:"org_id"`
+	ID    string `json:"id"`
+	OrgID string `json:"org_id"`
 	/** Dossier d'appartenance ; vide = racine. */
 	FolderID    string `json:"folder_id,omitempty"`
 	Name        string `json:"name"`
